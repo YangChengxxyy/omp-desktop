@@ -123,6 +123,130 @@ async fn approval_dialog_round_trip_lets_the_write_run(cx: &mut TestAppContext) 
 	_ = std::fs::remove_dir_all(&dir);
 }
 
+#[gpui_kit::test]
+#[ignore = "spawns omp and calls a model"]
+async fn ask_dialog_returns_multi_select_and_free_text(cx: &mut TestAppContext) {
+	let (handle, view, dir) = open_chat(cx, "ask", &["--tools", "ask", "--approval-mode", "yolo"]);
+	type_and(
+		cx,
+		handle,
+		"Use the ask tool exactly once: one multi-select question with id \"fruit\", options Apple, Banana, Cherry. \
+		 Then reply with exactly the selected options and any custom text I typed, comma separated, nothing else.",
+		"enter",
+	);
+	wait_until(cx, Duration::from_secs(120), "ask dialog opens", |cx| {
+		view.read_with(cx, |v, cx| v.open_ask_labels(cx).is_some())
+	});
+	let labels = view.read_with(cx, |v, cx| v.open_ask_labels(cx)).unwrap();
+	println!("ask options: {labels:?}");
+	let index = |name: &str| labels.iter().position(|l| l == name).unwrap_or_else(|| panic!("no {name} in {labels:?}"));
+	let (apple, cherry) = (index("Apple"), index("Cherry"));
+	cx.update_window(handle, |_, window, cx| {
+		window.click(("ask-option", apple), cx);
+		window.click(("ask-option", cherry), cx);
+		window.click(("ask-custom", 0usize), cx);
+		window.input("Durian", cx);
+		window.click("dialog-submit", cx);
+	})
+	.unwrap();
+
+	wait_until(cx, Duration::from_secs(120), "reply settles", |cx| {
+		view.read_with(cx, |v, cx| v.is_idle() && v.open_ask_labels(cx).is_none() && v.assistant_text().is_some())
+	});
+	let reply = view.read_with(cx, |v, _| v.assistant_text()).unwrap();
+	for expected in ["Apple", "Cherry", "Durian"] {
+		assert!(reply.contains(expected), "{expected} missing from reply {reply:?}");
+	}
+	assert!(!reply.contains("Banana"), "unselected option in reply {reply:?}");
+	_ = std::fs::remove_dir_all(&dir);
+}
+
+#[gpui_kit::test]
+#[ignore = "spawns omp and calls a model"]
+async fn busy_enter_queues_chip_removal_and_esc_aborts(cx: &mut TestAppContext) {
+	let (handle, view, dir) = open_chat(cx, "abort", &["--tools", "bash", "--approval-mode", "yolo"]);
+	type_and(cx, handle, "Run this exact bash command and nothing else: sleep 60", "enter");
+	wait_until(cx, Duration::from_secs(120), "bash starts", |cx| {
+		view.read_with(cx, |v, _| {
+			v.tool_runs_running("bash")
+		})
+	});
+
+	// Busy: Enter queues a follow-up instead of starting a turn.
+	type_and(cx, handle, "排队的追问", "enter");
+	wait_until(cx, Duration::from_secs(20), "follow-up chip appears", |cx| {
+		view.read_with(cx, |v, _| v.queue().follow_up == ["排队的追问"])
+	});
+	cx.update_window(handle, |_, window, cx| window.click(("queue-remove", 0usize), cx)).unwrap();
+	wait_until(cx, Duration::from_secs(20), "chip removed", |cx| {
+		view.read_with(cx, |v, _| v.queue().follow_up.is_empty() && v.queue().steering.is_empty())
+	});
+
+	// Empty composer + Esc stops the run long before `sleep 60` ends.
+	let stopped = Instant::now();
+	cx.update_window(handle, |_, window, cx| window.press("escape", cx)).unwrap();
+	wait_until(cx, Duration::from_secs(30), "abort settles", |cx| view.read_with(cx, |v, _| v.is_idle()));
+	assert!(stopped.elapsed() < Duration::from_secs(30), "abort took {:?}", stopped.elapsed());
+	assert!(view.read_with(cx, |v, _| !v.tool_runs_running("bash")), "bash still marked running");
+	// The removed follow-up never reached the transcript.
+	assert_eq!(view.read_with(cx, |v, _| v.user_texts()), ["Run this exact bash command and nothing else: sleep 60"]);
+	_ = std::fs::remove_dir_all(&dir);
+}
+
+#[gpui_kit::test]
+#[ignore = "spawns omp and calls a model"]
+async fn edit_card_renders_parsed_diff(cx: &mut TestAppContext) {
+	let (handle, view, dir) = open_chat(cx, "edit", &["--tools", "read,edit", "--approval-mode", "yolo"]);
+	std::fs::write(dir.join("demo.rs"), "fn main() {\n    let a = 1;\n    println!(\"{}\", a);\n}\n").unwrap();
+	type_and(cx, handle, "In demo.rs rename the variable a to b (both lines). Use read then edit. Nothing else.", "enter");
+	wait_until(cx, Duration::from_secs(180), "turn settles", |cx| view.read_with(cx, |v, _| v.is_idle()));
+
+	let diff = view.read_with(cx, |v, _| v.last_edit_diff()).expect("edit ran with a diff");
+	assert_eq!((diff.added, diff.removed), (2, 2), "{diff:?}");
+	assert!(std::fs::read_to_string(dir.join("demo.rs")).unwrap().contains("let b = 1;"));
+	// The card with the diff renders without panicking and its expander toggles.
+	cx.update_window(handle, |_, window, cx| window.render_frame(cx)).unwrap();
+	_ = std::fs::remove_dir_all(&dir);
+}
+
+/// Opens the real `ChatView` on a fresh temp dir and waits for omp.
+fn open_chat(
+	cx: &mut TestAppContext,
+	name: &str,
+	args: &[&str],
+) -> (gpui_kit::AnyWindowHandle, gpui_kit::Entity<ChatView>, std::path::PathBuf) {
+	cx.executor().allow_parking();
+	cx.update(gpui_kit::init);
+	cx.update(crate::theme::apply);
+	let dir = std::env::temp_dir().join(format!("omp-desktop-{name}-{}", std::process::id()));
+	_ = std::fs::remove_dir_all(&dir);
+	std::fs::create_dir_all(&dir).unwrap();
+	let mut extra_args: Vec<String> = ["--no-session", "--thinking", "off"].map(String::from).to_vec();
+	extra_args.extend(args.iter().map(|a| a.to_string()));
+	let options = SessionOptions { cwd: Some(dir.clone()), extra_args, ..Default::default() };
+	let (handle, view) = cx.update(|cx| {
+		gpui_kit::open_window(
+			WindowOptions {
+				window_bounds: Some(WindowBounds::Windowed(Bounds { origin: Point::default(), size: size(px(1000.), px(800.)) })),
+				..Default::default()
+			},
+			cx,
+			|window, cx| cx.new(|cx| ChatView::new(options, window, cx)),
+		)
+		.expect("open window")
+	});
+	wait_until(cx, Duration::from_secs(60), "omp connects", |cx| view.read_with(cx, |v, _| v.is_connected()));
+	(handle, view, dir)
+}
+
+fn type_and(cx: &mut TestAppContext, handle: gpui_kit::AnyWindowHandle, text: &str, key: &str) {
+	cx.update_window(handle, |_, window, cx| {
+		window.render_frame(cx);
+		window.input(text, cx);
+		window.press(key, cx);
+	})
+	.unwrap();
+}
 fn wait_until(
 	cx: &mut TestAppContext,
 	timeout: Duration,
@@ -166,5 +290,15 @@ impl ChatView {
 			})
 			.collect();
 		(!text.is_empty()).then_some(text)
+	}
+
+	fn tool_runs_running(&self, name: &str) -> bool {
+		self.tool_runs()
+			.iter()
+			.any(|(_, run)| run.name == name && run.status == omp_store::tools::Status::Running)
+	}
+
+	fn last_edit_diff(&self) -> Option<omp_store::tools::Diff> {
+		self.tool_runs().iter().filter(|(_, run)| run.name == "edit").find_map(|(_, run)| run.diff())
 	}
 }

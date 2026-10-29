@@ -14,17 +14,17 @@ cargo run -p omp-desktop                      # session in the current directory
 cargo run -p omp-desktop -- --cwd ~/work/repo # session in another directory
 ```
 
-Enter sends; Shift+Enter inserts a newline. While the agent is working, a new message is queued as a follow-up and the button switches to Stop (abort).
+Enter sends; Shift+Enter inserts a newline. While the agent is working, Enter queues a follow-up and ⌘Enter queues a steer (injected at the next tool boundary). Queued messages appear as chips above the composer: × withdraws one, 插队 promotes a follow-up to a steer. Esc in an empty composer, or the Stop button, aborts the run.
 
 ## What the basic version does
 
 - Streams replies from delta updates; `message_end` is authoritative.
-- Renders Markdown text, collapsible thinking, tool-call cards (arguments shown while they stream), and tool results.
+- Renders Markdown text and collapsible thinking. Each tool call is one card: `bash` streams its output with elapsed time, `edit` shows a line-numbered diff with +/- counts, `read` collapses to a one-line summary; failures are red and long output folds.
 - Answers omp dialogs: tool approval (`select`), `confirm`, `input` (masked when secret), `editor`, and `ask` (single/multi select, recommended option, free text).
 - Status bar: connection state, cwd, model, thinking level, context usage, session cost.
 - Startup errors (omp missing, too old, no protocol v2) and process exits show a reconnect action.
 
-Not yet: session list and tabs, image paste, slash-command completion, diff rendering for `edit`, subagent panel. See `docs/tech-plan.md` §5.
+Not yet: session list and tabs, image paste, slash-command completion, model/thinking switching, subagent panel. See `docs/tech-plan.md` §5.
 
 ## Layout
 
@@ -44,4 +44,4 @@ cargo test -p omp-desktop -- --ignored --test-threads 1  # headless UI against r
 cargo run -p omp-bridge --example stream                 # CLI check: delta rebuild == message_end
 ```
 
-The ignored UI tests open the real `ChatView` in a headless window, type a prompt, wait for the streamed reply, and drive a tool-approval dialog under `--approval-mode always-ask`.
+The ignored UI tests open the real `ChatView` in a headless window against real omp: a streamed reply; a one-time tool approval under `--approval-mode always-ask`; an `ask` dialog answered with two options plus free text; a follow-up queued while `sleep 60` runs, withdrawn from its chip, then Esc aborting the run; and an `edit` whose card diff parses to +2/-2.

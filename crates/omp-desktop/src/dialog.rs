@@ -86,6 +86,17 @@ impl DialogView {
 		}
 	}
 
+	/// Option labels of an open `ask` (all questions, in order).
+	#[cfg(test)]
+	pub(crate) fn ask_labels(&self) -> Option<Vec<String>> {
+		match &self.request {
+			ExtensionUiRequest::Ask(ask) => {
+				Some(ask.questions.iter().flat_map(|q| q.options.iter().map(|o| o.label.clone())).collect())
+			},
+			_ => None,
+		}
+	}
+
 	fn answer(&mut self, response: ExtensionUiResponse, cx: &mut Context<Self>) {
 		cx.emit(DialogEvent::Answered(response));
 	}
@@ -227,6 +238,7 @@ impl Render for DialogView {
 								row.child(div().pl_5().text_xs().text_color(rgb(p.muted_foreground)).child(description))
 							})
 							.on_click(cx.listener(move |this, _, _, cx| this.toggle(qi, label.clone(), multi, cx)))
+							.test_support()
 					});
 					div()
 						.flex()
@@ -238,7 +250,7 @@ impl Render for DialogView {
 						.child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(question.question.clone()))
 						.when(multi, |col| col.child(div().text_xs().text_color(rgb(p.muted_foreground)).child("可多选")))
 						.children(options)
-						.child(Input::new(&self.custom[qi]).small())
+						.child(div().id(("ask-custom", qi)).child(Input::new(&self.custom[qi]).small()).test_support())
 				});
 				("需要你的回答".to_owned(), div().flex().flex_col().gap_4().children(questions).into_any_element())
 			},

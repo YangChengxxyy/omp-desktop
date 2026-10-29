@@ -11,14 +11,26 @@ use gpui_kit::prelude::*;
 use gpui_kit::*;
 use omp_bridge::{Session, SessionOptions};
 use omp_rpc::{
-	AbortCommand, Client, Event, GetSessionStatsCommand, GetStateCommand, PromptCommand,
-	StreamingBehavior,
+	AbortCommand, Client, Event, GetSessionStatsCommand, GetStateCommand, PromoteQueuedMessageCommand,
+	PromptCommand, QueuedMessageQueue, RemoveQueuedMessageCommand, StreamingBehavior,
 };
-use omp_store::display::{Block, Role, ToolArgs, View};
+use omp_store::display::{Block, Role, View};
 
 use crate::dialog::{self, DialogEvent, DialogView};
 use crate::session::{Activity, Notice, SessionModel};
 use crate::theme;
+use crate::tool_card::{ToolCard, clip_lines, truncate};
+
+#[derive(Clone, Copy)]
+enum Delivery {
+	Normal,
+	Steer,
+}
+
+enum QueueAction {
+	Remove(String, QueuedMessageQueue),
+	Promote(String),
+}
 
 enum Connection {
 	Connecting,
@@ -47,15 +59,15 @@ impl ChatView {
 		let cwd = options.cwd.clone().unwrap_or_else(|| PathBuf::from("."));
 		let composer = cx.new(|cx| {
 			TextareaState::new(window, cx)
-				.placeholder("给 omp 发消息…（Enter 发送，Shift+Enter 换行）")
+				.placeholder("给 omp 发消息…（Enter 发送，Shift+Enter 换行；运行中 Enter 排队，⌘Enter 插队）")
 				.auto_grow(2, 10)
 				.submit_on_enter(true)
 		});
 		composer.update(cx, |state, cx| state.focus(window, cx));
-		let sub = cx.subscribe_in(&composer, window, |this, _, event, window, cx| {
-			if let InputEvent::PressEnter { shift: false, .. } = event {
-				this.send(window, cx);
-			}
+		let sub = cx.subscribe_in(&composer, window, |this, _, event, window, cx| match event {
+			InputEvent::PressEnter { secondary: true, .. } => this.send(Delivery::Steer, window, cx),
+			InputEvent::PressEnter { shift: false, .. } => this.send(Delivery::Normal, window, cx),
+			_ => {},
 		});
 		let list = ListState::new(0, ListAlignment::Top, px(600.));
 		list.set_follow_mode(FollowMode::Tail);
@@ -150,6 +162,21 @@ impl ChatView {
 		self.dialog.as_ref()?.read(cx).select_options()
 	}
 
+	#[cfg(test)]
+	pub(crate) fn open_ask_labels(&self, cx: &App) -> Option<Vec<String>> {
+		self.dialog.as_ref()?.read(cx).ask_labels()
+	}
+
+	#[cfg(test)]
+	pub(crate) fn queue(&self) -> &crate::session::Queue {
+		&self.model.queue
+	}
+
+	#[cfg(test)]
+	pub(crate) fn tool_runs(&self) -> &omp_store::tools::ToolRuns {
+		&self.model.tools
+	}
+
 	fn on_notification(&mut self, notification: omp_rpc::RpcNotification, cx: &mut Context<Self>) {
 		let effects = self.model.apply(notification);
 		if let Some((first, count)) = effects.rows {
@@ -230,7 +257,7 @@ impl ChatView {
 		cx.notify();
 	}
 
-	fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+	fn send(&mut self, delivery: Delivery, window: &mut Window, cx: &mut Context<Self>) {
 		let text = self.composer.read(cx).value().trim().to_owned();
 		let Some(client) = self.client() else {
 			return;
@@ -238,8 +265,12 @@ impl ChatView {
 		if text.is_empty() {
 			return;
 		}
-		// While the agent works, a new message queues as a follow-up.
-		let streaming_behavior = self.model.busy().then_some(StreamingBehavior::FollowUp);
+		// While the agent works, a message queues: as a follow-up for the next
+		// turn, or as a steer injected at the next tool boundary.
+		let streaming_behavior = self.model.busy().then_some(match delivery {
+			Delivery::Normal => StreamingBehavior::FollowUp,
+			Delivery::Steer => StreamingBehavior::Steer,
+		});
 		self.composer.update(cx, |state, cx| state.clean(window, cx));
 		self.model.prompt_sent();
 		let call = cx.background_spawn(async move {
@@ -264,6 +295,44 @@ impl ChatView {
 		};
 		cx.background_spawn(async move {
 			_ = client.call(&AbortCommand {});
+		})
+		.detach();
+	}
+
+	/// Esc in an empty composer stops the agent; with text it keeps the
+	/// input's own handling.
+	fn on_escape(&mut self, cx: &mut Context<Self>) {
+		if self.model.busy() && self.composer.read(cx).value().is_empty() {
+			self.abort(cx);
+		}
+	}
+
+	fn queue_action(&mut self, action: QueueAction, cx: &mut Context<Self>) {
+		let Some(client) = self.client() else {
+			return;
+		};
+		let call = cx.background_spawn(async move {
+			match action {
+				QueueAction::Remove(message, queue) => {
+					client.call(&RemoveQueuedMessageCommand { message, queue }).map(|r| r.removed)
+				},
+				QueueAction::Promote(message) => {
+					client.call(&PromoteQueuedMessageCommand { message }).map(|r| r.promoted)
+				},
+			}
+		});
+		cx.spawn(async move |this, cx| {
+			// The queue itself updates through `queue_update`; only report
+			// failures and no-ops (already delivered).
+			let notice = match call.await {
+				Ok(true) => return,
+				Ok(false) => Notice::Info("这条消息已经发出，无法再修改".into()),
+				Err(error) => Notice::Error(format!("队列操作失败：{error}")),
+			};
+			_ = this.update(cx, |this, cx| {
+				this.model.notices.push(notice);
+				cx.notify();
+			});
 		})
 		.detach();
 	}
@@ -318,6 +387,11 @@ impl ChatView {
 					col.child(div().text_sm().text_color(rgb(p.danger)).child(format!("错误：{error}")))
 				})
 				.into_any_element(),
+			// Shown inside the card of the call that produced it; a result with
+			// no matching call (history from an older run) falls back here.
+			Role::ToolResult { tool_call_id, .. } if self.model.tool_rows.contains_key(tool_call_id) => {
+				div().into_any_element()
+			},
 			Role::ToolResult { tool_name, is_error, .. } => {
 				let output: String = view
 					.blocks
@@ -328,7 +402,7 @@ impl ChatView {
 					})
 					.collect::<Vec<_>>()
 					.join("\n");
-				let (preview, more) = preview_lines(&output, 12);
+				let (preview, more) = clip_lines(&output, 12);
 				content
 					.py_1()
 					.child(
@@ -337,25 +411,15 @@ impl ChatView {
 							.border_1()
 							.border_color(if *is_error { rgb(p.danger) } else { rgb(p.border) })
 							.bg(rgb(p.code))
-							.child(
-								div()
-									.px_3()
-									.py_1()
-									.text_xs()
-									.text_color(if *is_error { rgb(p.danger) } else { rgb(p.muted_foreground) })
-									.child(format!("{} 结果{}", tool_name, if *is_error { "（失败）" } else { "" })),
-							)
-							.child(
-								div()
-									.px_3()
-									.pb_2()
-									.font_family("Menlo")
-									.text_xs()
-									.child(preview)
-									.when(more > 0, |d| {
-										d.child(div().text_color(rgb(p.muted_foreground)).child(format!("… 还有 {more} 行")))
-									}),
-							),
+							.px_3()
+							.py_2()
+							.font_family("Menlo")
+							.text_xs()
+							.child(div().text_color(rgb(p.muted_foreground)).child(tool_name.clone()))
+							.child(preview)
+							.when(more > 0, |d| {
+								d.child(div().text_color(rgb(p.muted_foreground)).child(format!("… 还有 {more} 行")))
+							}),
 					)
 					.into_any_element()
 			},
@@ -403,34 +467,24 @@ impl ChatView {
 					})
 					.into_any_element()
 			},
-			Block::ToolCall { name, arguments, intent, .. } => {
-				let (args, done) = match arguments {
-					ToolArgs::Complete(map) => (summarize_args(map), true),
-					ToolArgs::Partial(raw) => (raw.clone(), false),
-				};
-				div()
-					.rounded(px(8.))
-					.border_1()
-					.border_color(rgb(p.border))
-					.bg(rgb(p.elevated))
-					.px_3()
-					.py_2()
-					.flex()
-					.flex_col()
-					.gap_1()
-					.child(
-						div()
-							.flex()
-							.gap_2()
-							.text_xs()
-							.child(div().font_weight(FontWeight::SEMIBOLD).text_color(rgb(p.accent_foreground)).child(name.clone()))
-							.when_some(intent.clone(), |row, intent| {
-								row.child(div().text_color(rgb(p.muted_foreground)).child(intent))
-							})
-							.when(!done, |row| row.child(div().text_color(rgb(p.warning)).child("准备中…"))),
-					)
-					.child(div().font_family("Menlo").text_xs().text_color(rgb(p.muted_foreground)).child(args))
-					.into_any_element()
+			Block::ToolCall { id, name, arguments, intent } => {
+				let key = row * 64 + bi;
+				let expanded = self.expanded.contains(&(row, bi));
+				ToolCard {
+					id: key,
+					name,
+					args: arguments,
+					intent: intent.as_deref(),
+					run: self.model.tools.get(id),
+					expanded,
+				}
+				.render(p, cx.listener(move |this, _, _, cx| {
+					if !this.expanded.remove(&(row, bi)) {
+						this.expanded.insert((row, bi));
+					}
+					this.list.remeasure_items(row..row + 1);
+					cx.notify();
+				}))
 			},
 			Block::Image { mime_type } => {
 				div().text_xs().text_color(rgb(p.muted_foreground)).child(format!("[图片 {mime_type}]")).into_any_element()
@@ -483,24 +537,54 @@ impl ChatView {
 		let busy = self.model.busy();
 		let connected = matches!(self.connection, Connection::Connected(_));
 		let queue = &self.model.queue;
-		let chips = queue
+		let chip = |kind: &'static str, color: u32, text: &String, index: usize, queue: QueuedMessageQueue| {
+			let (remove, promote) = (text.clone(), text.clone());
+			let follow_up = queue == QueuedMessageQueue::FollowUp;
+			div()
+				.id(("queue-chip", index))
+				.flex()
+				.items_center()
+				.gap_1()
+				.pl_2()
+				.pr_1()
+				.h(px(26.))
+				.rounded(px(6.))
+				.border_1()
+				.border_color(rgb(p.border))
+				.bg(rgb(p.elevated))
+				.text_xs()
+				.child(div().font_weight(FontWeight::SEMIBOLD).text_color(rgb(color)).child(kind))
+				.child(truncate(text, 60))
+				.when(follow_up, |chip| {
+					chip.child(
+						Button::new(("queue-promote", index))
+							.ghost()
+							.xsmall()
+							.label("插队")
+							.tooltip("转为 steer，在下一个工具边界注入")
+							.on_click(cx.listener(move |this, _, _, cx| {
+								this.queue_action(QueueAction::Promote(promote.clone()), cx)
+							})),
+					)
+				})
+				.child(Button::new(("queue-remove", index)).ghost().xsmall().label("×").tooltip("撤回").on_click(
+					cx.listener(move |this, _, _, cx| this.queue_action(QueueAction::Remove(remove.clone(), queue), cx)),
+				))
+		};
+		let steering = queue.steering.len();
+		let chips: Vec<_> = queue
 			.steering
 			.iter()
-			.map(|text| ("插队", text, p.warning))
-			.chain(queue.follow_up.iter().map(|text| ("排队", text, p.accent_foreground)))
-			.map(|(kind, text, color)| {
-				div()
-					.flex()
-					.gap_1()
-					.px_2()
-					.py_0p5()
-					.rounded(px(6.))
-					.border_1()
-					.border_color(rgb(p.border))
-					.text_xs()
-					.child(div().text_color(rgb(color)).child(kind))
-					.child(truncate(text, 60))
-			});
+			.enumerate()
+			.map(|(i, text)| chip("插队", p.warning, text, i, QueuedMessageQueue::Steering))
+			.chain(
+				queue
+					.follow_up
+					.iter()
+					.enumerate()
+					.map(|(i, text)| chip("排队", p.accent_foreground, text, steering + i, QueuedMessageQueue::FollowUp)),
+			)
+			.collect();
 		div()
 			.flex_none()
 			.w_full()
@@ -517,21 +601,32 @@ impl ChatView {
 					.flex()
 					.items_end()
 					.gap_2()
-					.child(div().flex_1().child(Textarea::new(&self.composer).w_full()))
-					.child(if busy {
-						Button::new("abort")
-							.danger()
-							.label("停止")
-							.on_click(cx.listener(|this, _, _, cx| this.abort(cx)))
-							.into_any_element()
-					} else {
+					.child(
+						div()
+							.flex_1()
+							.capture_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+								if event.keystroke.key == "escape" {
+									this.on_escape(cx);
+								}
+							}))
+							.child(Textarea::new(&self.composer).w_full()),
+					)
+					.when(busy, |row| {
+						row.child(
+							Button::new("abort")
+								.danger()
+								.label("停止")
+								.tooltip("Esc（输入框为空时）")
+								.on_click(cx.listener(|this, _, _, cx| this.abort(cx))),
+						)
+					})
+					.child(
 						Button::new("send")
 							.primary()
-							.label("发送")
+							.label(if busy { "排队" } else { "发送" })
 							.disabled(!connected)
-							.on_click(cx.listener(|this, _, window, cx| this.send(window, cx)))
-							.into_any_element()
-					}),
+							.on_click(cx.listener(|this, _, window, cx| this.send(Delivery::Normal, window, cx))),
+					),
 			)
 	}
 
@@ -683,31 +778,4 @@ impl Render for ChatView {
 				)
 			})
 	}
-}
-
-fn summarize_args(args: &serde_json::Map<String, serde_json::Value>) -> String {
-	args.iter()
-		.filter(|(key, _)| key.as_str() != "i")
-		.map(|(key, value)| {
-			let value = match value {
-				serde_json::Value::String(s) => s.clone(),
-				other => other.to_string(),
-			};
-			format!("{key}: {}", truncate(&value, 200))
-		})
-		.collect::<Vec<_>>()
-		.join("\n")
-}
-
-fn truncate(text: &str, max: usize) -> String {
-	let mut chars = text.chars();
-	let head: String = chars.by_ref().take(max).collect();
-	if chars.next().is_some() { format!("{head}…") } else { head }
-}
-
-/// First `limit` lines and how many were left out.
-fn preview_lines(text: &str, limit: usize) -> (String, usize) {
-	let lines: Vec<&str> = text.lines().collect();
-	let shown = lines.len().min(limit);
-	(lines[..shown].join("\n"), lines.len() - shown)
 }

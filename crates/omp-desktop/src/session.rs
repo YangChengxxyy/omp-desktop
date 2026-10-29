@@ -25,6 +25,10 @@ pub enum Notice {
 #[derive(Default)]
 pub struct SessionModel {
 	pub transcript: Transcript,
+	pub tools:      omp_store::tools::ToolRuns,
+	/// Row of the assistant message that issued each tool call, so a tool
+	/// event can remeasure that row and its result renders inside the card.
+	pub tool_rows:  std::collections::HashMap<String, usize>,
 	pub activity:   ActivityState,
 	pub state:      Option<SessionState>,
 	/// Dialogs waiting for an answer, oldest first.
@@ -110,14 +114,24 @@ impl SessionModel {
 			},
 			_ => {},
 		}
-		let before = self.transcript.entries().len();
+		let rows = self.transcript.entries().len();
+		if self.tools.apply(&event)
+			&& let Some(id) = tool_call_id(&event)
+			&& let Some(&row) = self.tool_rows.get(id)
+		{
+			effects.rows = Some((row, rows));
+		}
 		if let Some(change) = self.transcript.apply(&event) {
 			let index = match change {
 				omp_store::Change::Started { index }
 				| omp_store::Change::Updated { index }
 				| omp_store::Change::Ended { index, .. } => index,
 			};
-			effects.rows = Some((index.min(before), self.transcript.entries().len()));
+			for id in tool_call_ids(&self.transcript.entries()[index].message) {
+				self.tool_rows.insert(id, index);
+			}
+			let first = effects.rows.map_or(index, |(row, _)| row.min(index));
+			effects.rows = Some((first.min(rows), self.transcript.entries().len()));
 		}
 	}
 
@@ -156,6 +170,30 @@ pub fn dialog_id(request: &ExtensionUiRequest) -> Option<&str> {
 		ExtensionUiRequest::Ask(r) => &r.id,
 		_ => return None,
 	})
+}
+
+fn tool_call_id(event: &RpcAgentEvent) -> Option<&str> {
+	Some(match event {
+		RpcAgentEvent::ToolExecutionStart(e) => &e.tool_call_id,
+		RpcAgentEvent::ToolExecutionUpdate(e) => &e.tool_call_id,
+		RpcAgentEvent::ToolExecutionEnd(e) => &e.tool_call_id,
+		_ => return None,
+	})
+}
+
+fn tool_call_ids(message: &omp_rpc::AgentMessage) -> Vec<String> {
+	let omp_rpc::AgentMessage::Assistant(message) = message else {
+		return Vec::new();
+	};
+	message
+		.content
+		.iter()
+		.flatten()
+		.filter_map(|block| match block {
+			omp_rpc::AssistantContent::ToolCall(call) => call.id.clone(),
+			_ => None,
+		})
+		.collect()
 }
 
 #[cfg(test)]
@@ -213,5 +251,19 @@ mod tests {
 		// The ended message updates its row in place.
 		assert_eq!(effects.rows, Some((0, 1)));
 		assert!(!m.transcript.entries()[0].streaming);
+	}
+
+	#[test]
+	fn tool_output_refreshes_the_row_that_issued_the_call() {
+		let mut m = SessionModel::default();
+		notify(&mut m, json!({"type":"message_end","messageId":"u","message":{"role":"user","content":"go"}}));
+		notify(&mut m, json!({"type":"message_end","messageId":"a","message":{"role":"assistant",
+			"content":[{"type":"toolCall","id":"c1","name":"bash","arguments":{"command":"ls"}}]}}));
+		notify(&mut m, json!({"type":"message_end","messageId":"u2","message":{"role":"user","content":"next"}}));
+		notify(&mut m, json!({"type":"tool_execution_start","toolCallId":"c1","toolName":"bash","args":{}}));
+		let effects = notify(&mut m, json!({"type":"tool_execution_update","toolCallId":"c1","toolName":"bash",
+			"args":{},"partialResult":{"content":[{"type":"text","text":"a.rs"}]}}));
+		assert_eq!(effects.rows, Some((1, 3)));
+		assert_eq!(m.tools.get("c1").unwrap().output, "a.rs");
 	}
 }

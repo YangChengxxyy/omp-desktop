@@ -5,6 +5,7 @@ mod chat;
 mod dialog;
 mod session;
 mod theme;
+mod tool_card;
 
 use std::path::PathBuf;
 
