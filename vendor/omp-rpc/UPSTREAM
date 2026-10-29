@@ -1,0 +1,4 @@
+repo: https://github.com/can1357/oh-my-pi
+tag: v18.13.3
+commit: 413d278a87a69b453efabf8d1fedb9940385e8c6
+path: sdk/rust/omp-rpc
