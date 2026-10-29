@@ -108,10 +108,13 @@ async fn approval_dialog_round_trip_lets_the_write_run(cx: &mut TestAppContext) 
 	});
 	assert!(!target.exists(), "write ran before approval");
 	let options = view.read_with(cx, |v, cx| v.open_dialog_options(cx)).unwrap();
+	// Only a one-time answer: "Always …" choices persist a grant in the user's
+	// real `approval-cache.db`.
+	println!("approval options: {options:?}");
 	let approve = options
 		.iter()
-		.position(|label| label.starts_with("Approve") || label.contains("允许") || label.contains("批准"))
-		.unwrap_or_else(|| panic!("no approve option in {options:?}"));
+		.position(|label| label == "Approve Once" || label == "Approve")
+		.unwrap_or_else(|| panic!("no one-time approve option in {options:?}"));
 	cx.update_window(handle, |_, window, cx| window.click(("select-option", approve), cx)).unwrap();
 
 	wait_until(cx, Duration::from_secs(120), "turn settles", |cx| view.read_with(cx, |v, _| v.is_idle()));
