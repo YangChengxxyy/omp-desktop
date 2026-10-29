@@ -1,0 +1,2380 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=1440, initial-scale=1.0" />
+  <title>omp-desktop UI 原型 (GPUI + gpui-kit 0.7)</title>
+  <style>
+    /* ==========================================================================
+       1. 语义 Token 定义（严格对应 docs/design/DESIGN.md §1）
+       ========================================================================== */
+    :root,
+    .theme-light {
+      --bg-background: #F7F6F2;
+      --bg-panel: #EFECE6;
+      --bg-elevated: #FFFFFF;
+      --bg-code: #F2F0EC;
+      --fg-default: #16181D;
+      --bg-muted: #E4E0D8;
+      --fg-muted: #5C606B;
+      --fg-subtle: #858A96;
+      --border-default: #DCD8CE;
+      --border-focus: #1E5EFF;
+
+      --color-primary: #1849D6;
+      --fg-on-primary: #FFFFFF;
+      --bg-accent: #E6EEFF;
+      --fg-accent: #123BB5;
+      --color-success: #137347;
+      --color-warning: #B25E09;
+      --color-danger: #C82829;
+
+      --diff-add-bg: #E6F6EC;
+      --diff-add-gutter: #C7ECD5;
+      --diff-add-fg: #0F5936;
+      --diff-del-bg: #FCECEB;
+      --diff-del-gutter: #F7D1CF;
+      --diff-del-fg: #A31D1E;
+
+      --thinking-bg: #F1EFEA;
+      --thinking-border: #D5D0C5;
+      --chip-steer-bg: #FFF3E0;
+      --chip-steer-fg: #9E4F00;
+      --modal-backdrop: rgba(22, 24, 29, 0.24);
+      --elevated-shadow: 0 10px 28px -4px rgba(15, 17, 21, 0.14);
+    }
+
+    .theme-dark {
+      --bg-background: #0F1115;
+      --bg-panel: #15181E;
+      --bg-elevated: #1C2028;
+      --bg-code: #0B0D10;
+      --fg-default: #E6E8EE;
+      --bg-muted: #232832;
+      --fg-muted: #8E95A5;
+      --fg-subtle: #636A78;
+      --border-default: #262B36;
+      --border-focus: #4C82FF;
+
+      --color-primary: #3B74FF;
+      --fg-on-primary: #FFFFFF;
+      --bg-accent: #19284D;
+      --fg-accent: #8AB0FF;
+      --color-success: #2EA063;
+      --color-warning: #E5922A;
+      --color-danger: #F05252;
+
+      --diff-add-bg: #122B1E;
+      --diff-add-gutter: #193D2A;
+      --diff-add-fg: #67D697;
+      --diff-del-bg: #301619;
+      --diff-del-gutter: #471E22;
+      --diff-del-fg: #F78686;
+
+      --thinking-bg: #14171D;
+      --thinking-border: #282E3A;
+      --chip-steer-bg: #2D2112;
+      --chip-steer-fg: #F5A646;
+      --modal-backdrop: rgba(5, 7, 10, 0.56);
+      --elevated-shadow: 0 12px 32px -4px rgba(0, 0, 0, 0.52);
+    }
+
+    /* ==========================================================================
+       2. 全局重置与排版阶梯（严格对应 DESIGN.md §2 & §3）
+       ========================================================================== */
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      background: #1A1D23;
+      color: var(--fg-default);
+      font-family: "Inter", -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+      font-size: 13.5px;
+      line-height: 21px;
+      -webkit-font-smoothing: antialiased;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 48px;
+      padding: 0;
+    }
+
+    code, pre, .mono {
+      font-family: "JetBrains Mono", "SF Mono", "Menlo", "Monaco", "PingFang SC", monospace;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .tabular {
+      font-variant-numeric: tabular-nums;
+    }
+
+    /* 每个原型画板严格固定为 1440×900 视口，方便无裁剪逐屏截图 */
+    .screen-frame {
+      width: 1440px;
+      height: 900px;
+      background: var(--bg-background);
+      color: var(--fg-default);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      position: relative;
+      border: 1px solid var(--border-default);
+      user-select: none;
+    }
+
+    /* SVG 图标通用样式 */
+    .icon {
+      width: 14px;
+      height: 14px;
+      stroke: currentColor;
+      stroke-width: 1.75;
+      fill: none;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+      flex-shrink: 0;
+    }
+    .icon-sm {
+      width: 12px;
+      height: 12px;
+    }
+
+    /* ==========================================================================
+       3. 顶栏与多进程 Tab 栏（36px）
+       ========================================================================== */
+    .titlebar {
+      height: 36px;
+      background: var(--bg-panel);
+      border-bottom: 1px solid var(--border-default);
+      display: flex;
+      align-items: stretch;
+      justify-content: space-between;
+      padding-left: 14px;
+      padding-right: 10px;
+      flex-shrink: 0;
+    }
+
+    .titlebar-left {
+      display: flex;
+      align-items: stretch;
+      gap: 0;
+      overflow: hidden;
+    }
+
+    .traffic-lights {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding-right: 16px;
+    }
+
+    .traffic-dot {
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+    }
+    .traffic-close { background: #FF5F56; border: 1px solid #E0443E; }
+    .traffic-min { background: #FFBD2E; border: 1px solid #DEA123; }
+    .traffic-max { background: #27C93F; border: 1px solid #1AAB29; }
+
+    .tab-strip {
+      display: flex;
+      align-items: stretch;
+    }
+
+    .tab-item {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      padding: 0 12px;
+      font-size: 12px;
+      line-height: 18px;
+      color: var(--fg-muted);
+      border-right: 1px solid var(--border-default);
+      position: relative;
+      cursor: default;
+      white-space: nowrap;
+    }
+
+    .tab-item.active {
+      background: var(--bg-background);
+      color: var(--fg-default);
+      font-weight: 500;
+    }
+
+    .tab-item.active::after {
+      content: "";
+      position: absolute;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      height: 2px;
+      background: var(--color-primary);
+    }
+
+    .status-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+    .dot-streaming { background: var(--color-primary); }
+    .dot-settled { background: var(--color-success); }
+    .dot-warning { background: var(--color-warning); }
+    .dot-danger { background: var(--color-danger); }
+
+    .tab-badge {
+      font-size: 11px;
+      line-height: 15px;
+      padding: 0 5px;
+      white-space: nowrap;
+      flex-shrink: 0;
+      border-radius: 4px;
+      font-weight: 500;
+    }
+    .badge-streaming {
+      background: var(--bg-accent);
+      color: var(--fg-accent);
+    }
+    .badge-danger {
+      background: var(--diff-del-bg);
+      color: var(--diff-del-fg);
+    }
+    .badge-warning {
+      background: var(--chip-steer-bg);
+      color: var(--chip-steer-fg);
+    }
+
+    .tab-close {
+      color: var(--fg-subtle);
+      font-size: 12px;
+      margin-left: 2px;
+    }
+
+    .tab-add-btn {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: 30px;
+      color: var(--fg-muted);
+    }
+
+    .titlebar-right {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .toolbar-btn {
+      height: 24px;
+      padding: 0 8px;
+      border-radius: 4px;
+      border: 1px solid var(--border-default);
+      background: var(--bg-elevated);
+      color: var(--fg-muted);
+      font-size: 11px;
+      display: flex;
+      align-items: center;
+      gap: 5px;
+    }
+
+    .kbd {
+      font-family: "JetBrains Mono", monospace;
+      font-size: 11px;
+      line-height: 15px;
+      padding: 0 4px;
+      border-radius: 4px;
+      background: var(--bg-muted);
+      color: var(--fg-muted);
+      border: 1px solid var(--border-default);
+    }
+
+    /* ==========================================================================
+       4. 主工作区三栏骨架
+       ========================================================================== */
+    .workspace {
+      flex: 1;
+      display: flex;
+      min-height: 0;
+      overflow: hidden;
+    }
+
+    /* 左侧会话栏 256px */
+    .sidebar {
+      width: 256px;
+      background: var(--bg-panel);
+      border-right: 1px solid var(--border-default);
+      display: flex;
+      flex-direction: column;
+      flex-shrink: 0;
+    }
+
+    .sidebar-header {
+      padding: 10px 10px 8px;
+      border-bottom: 1px solid var(--border-default);
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .search-box {
+      height: 28px;
+      background: var(--bg-elevated);
+      border: 1px solid var(--border-default);
+      border-radius: 6px;
+      padding: 0 8px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      color: var(--fg-subtle);
+      font-size: 12px;
+    }
+
+    .sidebar-section {
+      padding: 8px 6px 4px;
+      overflow-y: auto;
+      flex: 1;
+    }
+
+    .cwd-group-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 4px 6px;
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--fg-muted);
+    }
+
+    .session-item {
+      padding: 6px 8px;
+      border-radius: 6px;
+      margin-bottom: 2px;
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      border: 1px solid transparent;
+    }
+
+    .session-item.selected {
+      background: var(--bg-accent);
+      border-color: var(--border-focus);
+    }
+
+    .session-item-top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px;
+    }
+
+    .session-title {
+      font-size: 12px;
+      line-height: 18px;
+      color: var(--fg-default);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      font-weight: 500;
+    }
+
+    .session-item.selected .session-title {
+      color: var(--fg-accent);
+      font-weight: 600;
+    }
+
+    .session-time {
+      font-size: 11px;
+      color: var(--fg-subtle);
+      flex-shrink: 0;
+    }
+
+    .session-item-sub {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 11px;
+      color: var(--fg-muted);
+    }
+
+    .sidebar-footer {
+      padding: 8px 10px;
+      border-top: 1px solid var(--border-default);
+      font-size: 11px;
+      color: var(--fg-subtle);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    /* ==========================================================================
+       5. 中央对话主区
+       ========================================================================== */
+    .main-pane {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+      background: var(--bg-background);
+      position: relative;
+    }
+
+    .session-subheader {
+      height: 32px;
+      padding: 0 16px;
+      border-bottom: 1px solid var(--border-default);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 12px;
+      color: var(--fg-muted);
+      background: var(--bg-background);
+      flex-shrink: 0;
+    }
+
+    .subheader-left, .subheader-right {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .chat-scroll {
+      flex: 1;
+      overflow-y: auto;
+      padding: 14px 20px 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    /* 用户消息 */
+    .msg-user {
+      background: var(--bg-panel);
+      border: 1px solid var(--border-default);
+      border-radius: 6px;
+      padding: 8px 12px;
+    }
+
+    .msg-meta {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 11px;
+      color: var(--fg-muted);
+      margin-bottom: 4px;
+    }
+
+    .msg-user-body {
+      font-size: 13.5px;
+      line-height: 21px;
+      color: var(--fg-default);
+      max-width: 72ch;
+    }
+
+    .inline-code {
+      font-family: "JetBrains Mono", monospace;
+      font-size: 12px;
+      padding: 1px 5px;
+      background: var(--bg-muted);
+      border-radius: 4px;
+      color: var(--fg-default);
+    }
+
+    /* 助手回复流 */
+    .msg-assistant {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    /* Thinking 折叠块 */
+    .thinking-block {
+      background: var(--thinking-bg);
+      border: 1px solid var(--thinking-border);
+      border-radius: 6px;
+      padding: 5px 10px;
+      font-size: 12px;
+      color: var(--fg-muted);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    /* 工具调用卡片（Edit Diff） */
+    .tool-card {
+      border: 1px solid var(--border-default);
+      border-radius: 8px;
+      background: var(--bg-elevated);
+      overflow: hidden;
+    }
+
+    .tool-card-header {
+      height: 30px;
+      padding: 0 10px;
+      background: var(--bg-panel);
+      border-bottom: 1px solid var(--border-default);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 12px;
+    }
+
+    .tool-header-left {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .tool-tag {
+      font-family: "JetBrains Mono", monospace;
+      font-size: 11px;
+      font-weight: 600;
+      padding: 1px 6px;
+      border-radius: 4px;
+      background: var(--bg-muted);
+      color: var(--fg-default);
+    }
+
+    .diff-stat-add { color: var(--color-success); font-weight: 600; }
+    .diff-stat-del { color: var(--color-danger); font-weight: 600; }
+
+    .diff-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-family: "JetBrains Mono", monospace;
+      font-size: 12px;
+      line-height: 18px;
+      background: var(--bg-code);
+    }
+
+    .diff-row td {
+      padding: 1px 8px;
+      white-space: pre;
+    }
+
+    .diff-ln {
+      width: 34px;
+      text-align: right;
+      color: var(--fg-subtle);
+      user-select: none;
+      border-right: 1px solid var(--border-default);
+      padding-right: 6px !important;
+    }
+
+    .diff-sign {
+      width: 18px;
+      text-align: center;
+      user-select: none;
+    }
+
+    .diff-row.del {
+      background: var(--diff-del-bg);
+      color: var(--diff-del-fg);
+    }
+    .diff-row.del .diff-ln {
+      background: var(--diff-del-gutter);
+      color: var(--diff-del-fg);
+    }
+
+    .diff-row.add {
+      background: var(--diff-add-bg);
+      color: var(--diff-add-fg);
+    }
+    .diff-row.add .diff-ln {
+      background: var(--diff-add-gutter);
+      color: var(--diff-add-fg);
+    }
+
+    .word-hl-add {
+      background: var(--diff-add-gutter);
+      border-radius: 2px;
+      padding: 0 2px;
+    }
+    .word-hl-del {
+      background: var(--diff-del-gutter);
+      border-radius: 2px;
+      padding: 0 2px;
+    }
+
+    /* 助手流式正文 */
+    .assistant-prose {
+      font-size: 13.5px;
+      line-height: 21px;
+      color: var(--fg-default);
+      max-width: 74ch;
+    }
+
+    .streaming-cursor {
+      display: inline-block;
+      width: 7px;
+      height: 14px;
+      background: var(--color-primary);
+      vertical-align: -2px;
+      margin-left: 3px;
+    }
+
+    /* ==========================================================================
+       6. 内联 Ask 多问题交互对话框（extension_ui_request: ask）
+       ========================================================================== */
+    .ask-dialog-card {
+      margin: 0 20px 8px;
+      border: 1px solid var(--border-focus);
+      border-radius: 10px;
+      background: var(--bg-elevated);
+      box-shadow: var(--elevated-shadow);
+      overflow: hidden;
+      flex-shrink: 0;
+    }
+
+    .ask-header {
+      height: 32px;
+      padding: 0 12px;
+      background: var(--bg-accent);
+      border-bottom: 1px solid var(--border-default);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 12px;
+    }
+
+    .ask-title {
+      font-weight: 600;
+      color: var(--fg-accent);
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .ask-body {
+      padding: 10px 12px;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+    }
+
+    .ask-question-col {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .ask-q-label {
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--fg-default);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .ask-option {
+      border: 1px solid var(--border-default);
+      border-radius: 6px;
+      padding: 6px 8px;
+      background: var(--bg-background);
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
+      font-size: 12px;
+    }
+
+    .ask-option.selected {
+      border-color: var(--border-focus);
+      background: var(--bg-accent);
+    }
+
+    .radio-dot, .check-box {
+      width: 14px;
+      height: 14px;
+      margin-top: 2px;
+      border: 1.5px solid var(--fg-muted);
+      flex-shrink: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .radio-dot { border-radius: 50%; }
+    .check-box { border-radius: 3px; }
+
+    .ask-option.selected .radio-dot,
+    .ask-option.selected .check-box {
+      border-color: var(--color-primary);
+      background: var(--color-primary);
+      color: var(--fg-on-primary);
+    }
+
+    .opt-content {
+      flex: 1;
+      min-width: 0;
+    }
+
+    .opt-title-row {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-weight: 500;
+      color: var(--fg-default);
+    }
+
+    .rec-badge {
+      font-size: 10px;
+      line-height: 14px;
+      padding: 0 5px;
+      border-radius: 4px;
+      background: var(--color-primary);
+      color: var(--fg-on-primary);
+      font-weight: 600;
+    }
+
+    .opt-desc {
+      font-size: 11px;
+      line-height: 15px;
+      color: var(--fg-muted);
+      margin-top: 1px;
+    }
+
+    .free-input-row {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      border: 1px solid var(--border-default);
+      border-radius: 6px;
+      padding: 4px 8px;
+      background: var(--bg-background);
+      font-size: 12px;
+      color: var(--fg-subtle);
+    }
+
+    .ask-footer {
+      height: 34px;
+      padding: 0 12px;
+      background: var(--bg-panel);
+      border-top: 1px solid var(--border-default);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 11px;
+      color: var(--fg-muted);
+    }
+
+    .btn-group {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-shrink: 0;
+      white-space: nowrap;
+    }
+
+    .btn {
+      height: 24px;
+      padding: 0 8px;
+      border-radius: 5px;
+      font-size: 11.5px;
+      font-weight: 500;
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      border: 1px solid var(--border-default);
+      background: var(--bg-elevated);
+      color: var(--fg-default);
+      white-space: nowrap;
+      flex-shrink: 0;
+    }
+
+    .btn-primary {
+      background: var(--color-primary);
+      border-color: var(--color-primary);
+      color: var(--fg-on-primary);
+    }
+
+    .btn-danger {
+      background: var(--diff-del-bg);
+      border-color: var(--color-danger);
+      color: var(--diff-del-fg);
+    }
+
+    /* ==========================================================================
+       7. 队列 Chip 栏 + 底部多行输入框（Composer）
+       ========================================================================== */
+    .composer-dock {
+      padding: 0 20px 10px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      flex-shrink: 0;
+    }
+
+    .queue-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      background: var(--bg-panel);
+      border: 1px solid var(--border-default);
+      border-radius: 6px;
+      padding: 4px 8px;
+      font-size: 12px;
+    }
+
+    .queue-chip-left {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-width: 0;
+    }
+
+    .chip-type-followup {
+      font-family: "JetBrains Mono", monospace;
+      font-size: 10px;
+      font-weight: 600;
+      padding: 1px 6px;
+      border-radius: 4px;
+      background: var(--bg-accent);
+      color: var(--fg-accent);
+      white-space: nowrap;
+      flex-shrink: 0;
+    }
+
+    .queue-actions {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-shrink: 0;
+    }
+
+    .chip-action-btn {
+      font-size: 11px;
+      padding: 1px 6px;
+      border-radius: 4px;
+      border: 1px solid var(--border-default);
+      background: var(--bg-elevated);
+      color: var(--fg-muted);
+      white-space: nowrap;
+      flex-shrink: 0;
+    }
+
+    .composer-box {
+      border: 1px solid var(--border-default);
+      border-radius: 8px;
+      background: var(--bg-elevated);
+      display: flex;
+      flex-direction: column;
+    }
+
+    .composer-input {
+      padding: 8px 12px;
+      font-size: 13px;
+      line-height: 20px;
+      color: var(--fg-default);
+      min-height: 44px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .ime-marked {
+      border-bottom: 1.5px solid var(--color-primary);
+      background: var(--bg-accent);
+      padding: 0 2px;
+    }
+
+    .composer-toolbar {
+      height: 30px;
+      padding: 0 8px;
+      border-top: 1px solid var(--border-default);
+      background: var(--bg-panel);
+      border-bottom-left-radius: 7px;
+      border-bottom-right-radius: 7px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 11px;
+      color: var(--fg-muted);
+    }
+
+    .composer-tools-left {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      flex-shrink: 0;
+    }
+
+    .pill-control {
+      padding: 1px 6px;
+      border-radius: 4px;
+      background: var(--bg-elevated);
+      border: 1px solid var(--border-default);
+      color: var(--fg-default);
+      font-size: 11px;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      white-space: nowrap;
+      flex-shrink: 0;
+    }
+
+    /* ==========================================================================
+       8. 右侧监控面板（Todo & Subagents，280px）
+       ========================================================================== */
+    .inspector-pane {
+      width: 280px;
+      background: var(--bg-panel);
+      border-left: 1px solid var(--border-default);
+      display: flex;
+      flex-direction: column;
+      flex-shrink: 0;
+    }
+
+    .panel-block {
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--border-default);
+    }
+
+    .panel-title-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--fg-muted);
+      margin-bottom: 8px;
+    }
+
+    .todo-list {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      font-size: 12px;
+    }
+
+    .todo-item {
+      display: flex;
+      align-items: flex-start;
+      gap: 7px;
+      line-height: 17px;
+    }
+    .todo-done { color: var(--fg-subtle); text-decoration: line-through; }
+    .todo-active { color: var(--fg-default); font-weight: 500; }
+
+    .subagent-card {
+      background: var(--bg-elevated);
+      border: 1px solid var(--border-default);
+      border-radius: 6px;
+      padding: 8px 9px;
+      margin-bottom: 8px;
+      display: flex;
+      flex-direction: column;
+      gap: 5px;
+    }
+
+    .subagent-top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 12px;
+      font-weight: 600;
+    }
+
+    .subagent-log {
+      font-family: "JetBrains Mono", monospace;
+      font-size: 11px;
+      color: var(--fg-muted);
+      background: var(--bg-code);
+      padding: 3px 6px;
+      border-radius: 4px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .subagent-actions {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-top: 2px;
+    }
+
+    /* ==========================================================================
+       9. 底部全局状态栏（26px）
+       ========================================================================== */
+    .statusbar {
+      height: 26px;
+      background: var(--bg-panel);
+      border-top: 1px solid var(--border-default);
+      padding: 0 12px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 11px;
+      color: var(--fg-muted);
+      flex-shrink: 0;
+    }
+
+    .status-group {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+    }
+
+    .status-item {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+    }
+
+    .ctx-meter {
+      width: 56px;
+      height: 6px;
+      background: var(--bg-muted);
+      border-radius: 3px;
+      overflow: hidden;
+    }
+
+    .ctx-fill {
+      height: 100%;
+      background: var(--color-primary);
+    }
+
+    /* ==========================================================================
+       10. 空状态、断开横幅、首次启动异常页专用样式
+       ========================================================================== */
+    .empty-stage {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 32px;
+    }
+
+    .empty-container {
+      width: 640px;
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+    }
+
+    .quick-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+    }
+
+    .quick-card {
+      background: var(--bg-elevated);
+      border: 1px solid var(--border-default);
+      border-radius: 8px;
+      padding: 12px 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .disconnect-banner {
+      margin: 12px 20px 0;
+      padding: 10px 14px;
+      background: var(--diff-del-bg);
+      border: 1px solid var(--color-danger);
+      border-radius: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      color: var(--diff-del-fg);
+    }
+
+    .onboarding-stage {
+      flex: 1;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 40px;
+      background: var(--bg-background);
+    }
+
+    .diag-panel {
+      width: 820px;
+      background: var(--bg-elevated);
+      border: 1px solid var(--border-default);
+      border-radius: 10px;
+      overflow: hidden;
+    }
+
+    .diag-header {
+      padding: 18px 24px;
+      background: var(--bg-panel);
+      border-bottom: 1px solid var(--border-default);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .diag-list {
+      padding: 20px 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+
+    .diag-item {
+      border: 1px solid var(--border-default);
+      border-radius: 8px;
+      padding: 12px 16px;
+      background: var(--bg-background);
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .cmd-snippet {
+      background: var(--bg-code);
+      border: 1px solid var(--border-default);
+      border-radius: 6px;
+      padding: 6px 10px;
+      font-family: "JetBrains Mono", monospace;
+      font-size: 12px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+  </style>
+</head>
+<body>
+
+  <!-- ==========================================================================
+       SECTION 1: #main-light（亮色主题主视图：多Tab + 会话列表 + Edit Diff + 流式回复 + Ask 弹窗 + Follow-up Chip）
+       ========================================================================== -->
+  <section id="main-light" class="screen-frame theme-light">
+    <!-- 顶栏 36px -->
+    <header class="titlebar">
+      <div class="titlebar-left">
+        <div class="traffic-lights">
+          <span class="traffic-dot traffic-close"></span>
+          <span class="traffic-dot traffic-min"></span>
+          <span class="traffic-dot traffic-max"></span>
+        </div>
+        <div class="tab-strip">
+          <div class="tab-item active">
+            <span class="status-dot dot-streaming"></span>
+            <span>omp-desktop · 实现增量消息重建</span>
+            <span class="tab-badge badge-streaming mono">流式中 · 待确认</span>
+            <span class="tab-close">×</span>
+          </div>
+          <div class="tab-item">
+            <span class="status-dot dot-settled"></span>
+            <span>oh-my-pi · 核对 v18.13.3 wire.rs</span>
+            <span class="tab-close">×</span>
+          </div>
+          <div class="tab-item">
+            <span class="status-dot dot-danger"></span>
+            <span>trainpal-crn · 详情页预加载</span>
+            <span class="tab-badge badge-danger">已断开</span>
+            <span class="tab-close">×</span>
+          </div>
+          <div class="tab-add-btn">+</div>
+        </div>
+      </div>
+      <div class="titlebar-right">
+        <div class="toolbar-btn">
+          <span>左侧栏</span>
+          <span class="kbd">⌘B</span>
+        </div>
+        <div class="toolbar-btn">
+          <span>子 Agent 监控</span>
+          <span class="kbd">⌘J</span>
+        </div>
+      </div>
+    </header>
+
+    <!-- 三栏工作区 -->
+    <div class="workspace">
+      <!-- 左侧历史会话栏 -->
+      <aside class="sidebar">
+        <div class="sidebar-header">
+          <div class="search-box">
+            <span>搜索会话或项目路径...</span>
+            <span class="kbd">⌘P</span>
+          </div>
+        </div>
+        <div class="sidebar-section">
+          <div class="cwd-group-header">
+            <span class="mono">~/Project/omp-desktop</span>
+            <span class="tabular">3</span>
+          </div>
+          <div class="session-item selected">
+            <div class="session-item-top">
+              <span class="session-title">实现增量消息重建与 SetEventFilterDelta</span>
+              <span class="session-time tabular">刚刚</span>
+            </div>
+            <div class="session-item-sub">
+              <span class="mono">#8f3a · PID 48291</span>
+              <span style="color: var(--color-primary); font-weight: 600;">当前 Tab</span>
+            </div>
+          </div>
+          <div class="session-item">
+            <div class="session-item-top">
+              <span class="session-title">调研 gpui-kit 0.7 虚拟列表与中文 IME</span>
+              <span class="session-time tabular">42m</span>
+            </div>
+            <div class="session-item-sub">
+              <span class="mono">#4c19 · 28 条消息</span>
+              <span>已归档</span>
+            </div>
+          </div>
+          <div class="session-item">
+            <div class="session-item-top">
+              <span class="session-title">稀疏检出 vendor/omp-rpc v18.13.3</span>
+              <span class="session-time tabular">3h</span>
+            </div>
+            <div class="session-item-sub">
+              <span class="mono">#19b0 · 14 条消息</span>
+              <span>v2</span>
+            </div>
+          </div>
+
+          <div class="cwd-group-header" style="margin-top: 10px;">
+            <span class="mono">~/Project/oh-my-pi</span>
+            <span class="tabular">2</span>
+          </div>
+          <div class="session-item">
+            <div class="session-item-top">
+              <span class="session-title">对比 v18.13.3 与 main 分支 wire.rs 差异</span>
+              <span class="session-time tabular">昨天</span>
+            </div>
+            <div class="session-item-sub">
+              <span class="mono">#9e21 · PID 48310</span>
+              <span style="color: var(--color-success);">Tab 2 运行中</span>
+            </div>
+          </div>
+          <div class="session-item">
+            <div class="session-item-top">
+              <span class="session-title">验证 rpc-ui 模式下 set_ask_dialog 协议</span>
+              <span class="session-time tabular">10-27</span>
+            </div>
+            <div class="session-item-sub">
+              <span class="mono">#7d04 · 19 条消息</span>
+              <span>v2</span>
+            </div>
+          </div>
+        </div>
+        <div class="sidebar-footer">
+          <span class="mono">~/.omp/agent/sessions</span>
+          <span class="tabular">共 5 个会话</span>
+        </div>
+      </aside>
+
+      <!-- 中央对话主区 -->
+      <main class="main-pane">
+        <div class="session-subheader">
+          <div class="subheader-left">
+            <span class="mono" style="color: var(--fg-default); font-weight: 500;">~/Project/omp-desktop</span>
+            <span>·</span>
+            <span class="mono">git: feat/omp-bridge-delta</span>
+            <span>·</span>
+            <span class="mono">session: 2026-10-29_8f3a.jsonl</span>
+          </div>
+          <div class="subheader-right">
+            <span class="pill-control mono">Fork 分支</span>
+            <span class="pill-control mono">Compact 压缩</span>
+          </div>
+        </div>
+
+        <!-- 对话流 -->
+        <div class="chat-scroll">
+          <!-- 用户消息 -->
+          <div class="msg-user">
+            <div class="msg-meta">
+              <span><strong>你 (User)</strong> · 14:22:08</span>
+              <span class="mono">#msg_01 · [Fork] [编辑]</span>
+            </div>
+            <div class="msg-user-body">
+              在 <span class="inline-code">crates/omp-bridge/src/filter.rs</span> 里补齐 <span class="inline-code">SetEventFilterDelta</span> 命令，开启 <span class="inline-code">messageUpdates: "delta"</span>，并在 <span class="inline-code">omp-store</span> 中处理增量回退兼容。
+            </div>
+          </div>
+
+          <!-- 助手消息（含折叠 Thinking + Edit Diff 卡片 + 正在流式输出的回复） -->
+          <div class="msg-assistant">
+            <div class="thinking-block">
+              <span>▸ <strong>思考过程 (Thinking)</strong> · 已核对 omp-rpc Command trait 签名与 data.messageUpdates 降级分支</span>
+              <span class="mono tabular">3.4s · 620 tokens</span>
+            </div>
+
+            <!-- Edit 工具卡片 -->
+            <div class="tool-card">
+              <div class="tool-card-header">
+                <div class="tool-header-left">
+                  <span class="tool-tag">edit</span>
+                  <span class="mono" style="font-weight: 500;">crates/omp-bridge/src/filter.rs</span>
+                  <span class="mono" style="color: var(--fg-subtle);">[#3F8A]</span>
+                  <span class="mono diff-stat-add tabular">+14</span>
+                  <span class="mono diff-stat-del tabular">-3</span>
+                </div>
+                <div class="btn-group">
+                  <span class="mono" style="font-size: 11px; color: var(--color-success);">✓ 已应用 · 18ms</span>
+                  <span class="pill-control mono">Unified</span>
+                </div>
+              </div>
+              <table class="diff-table">
+                <tbody>
+                  <tr class="diff-row">
+                    <td class="diff-ln">12</td>
+                    <td class="diff-ln">12</td>
+                    <td class="diff-sign"> </td>
+                    <td>use omp_rpc::wire::{Command, SetEventFilterCommand};</td>
+                  </tr>
+                  <tr class="diff-row del">
+                    <td class="diff-ln">13</td>
+                    <td class="diff-ln"></td>
+                    <td class="diff-sign">-</td>
+                    <td>pub fn enable_event_stream(client: &amp;Client) -&gt; Result&lt;(), Error&gt; {</td>
+                  </tr>
+                  <tr class="diff-row del">
+                    <td class="diff-ln">14</td>
+                    <td class="diff-ln"></td>
+                    <td class="diff-sign">-</td>
+                    <td>    client.call(<span class="word-hl-del">SetEventFilterCommand { events: None }</span>).map(|_| ())</td>
+                  </tr>
+                  <tr class="diff-row add">
+                    <td class="diff-ln"></td>
+                    <td class="diff-ln">13</td>
+                    <td class="diff-sign">+</td>
+                    <td>#[derive(Serialize)]</td>
+                  </tr>
+                  <tr class="diff-row add">
+                    <td class="diff-ln"></td>
+                    <td class="diff-ln">14</td>
+                    <td class="diff-sign">+</td>
+                    <td>pub struct <span class="word-hl-add">SetEventFilterDelta</span> { pub events: Option&lt;Vec&lt;String&gt;&gt;, pub <span class="word-hl-add">message_updates: &amp;'static str</span> }</td>
+                  </tr>
+                  <tr class="diff-row add">
+                    <td class="diff-ln"></td>
+                    <td class="diff-ln">15</td>
+                    <td class="diff-sign">+</td>
+                    <td>pub fn enable_delta_stream(client: &amp;Client) -&gt; Result&lt;StreamMode, Error&gt; {</td>
+                  </tr>
+                  <tr class="diff-row add">
+                    <td class="diff-ln"></td>
+                    <td class="diff-ln">16</td>
+                    <td class="diff-sign">+</td>
+                    <td>    let resp = client.call(SetEventFilterDelta { events: None, <span class="word-hl-add">message_updates: "delta"</span> })?;</td>
+                  </tr>
+                  <tr class="diff-row">
+                    <td class="diff-ln">15</td>
+                    <td class="diff-ln">17</td>
+                    <td class="diff-sign"> </td>
+                    <td>}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <!-- 正在流式输出的回复 -->
+            <div class="assistant-prose">
+              已完成 <span class="inline-code">SetEventFilterDelta</span> 结构体定义并验证了 <span class="inline-code">data.messageUpdates == "delta"</span> 的握手判断。接下来在编写 <span class="inline-code">omp-store</span> 的消息重建状态机前，需要确认两个边界策略：<span class="streaming-cursor"></span>
+            </div>
+          </div>
+        </div>
+
+        <!-- 打开的 Ask 多问题交互对话框（extension_ui_request: ask） -->
+        <div class="ask-dialog-card">
+          <div class="ask-header">
+            <div class="ask-title">
+              <span>● Agent 询问实现细节 (extension_ui_request · ask)</span>
+              <span class="mono" style="font-weight: 400; color: var(--fg-muted);">id: req_ask_902</span>
+            </div>
+            <span class="mono" style="font-size: 11px; color: var(--fg-muted);">支持数字键 1-3 快选 · Esc 取消</span>
+          </div>
+          <div class="ask-body">
+            <!-- 问题 1：单选 + 推荐项 -->
+            <div class="ask-question-col">
+              <div class="ask-q-label">
+                <span>1. 旧版 omp 不支持 delta 时的回退行为？</span>
+                <span class="mono" style="font-size: 11px; color: var(--fg-muted);">单选 (Radio)</span>
+              </div>
+              <div class="ask-option selected">
+                <span class="radio-dot">●</span>
+                <div class="opt-content">
+                  <div class="opt-title-row">
+                    <span>自动回退完整快照并记录状态栏告警</span>
+                    <span class="rec-badge">推荐</span>
+                  </div>
+                  <div class="opt-desc">当响应无 data.messageUpdates == "delta" 时无缝切回全量覆盖</div>
+                </div>
+              </div>
+              <div class="ask-option">
+                <span class="radio-dot"></span>
+                <div class="opt-content">
+                  <div class="opt-title-row">
+                    <span>严格阻断连接并要求升级 omp</span>
+                  </div>
+                  <div class="opt-desc">仅允许支持 delta 增量流的 omp 进程建立会话</div>
+                </div>
+              </div>
+            </div>
+
+            <!-- 问题 2：多选 + 自由输入 -->
+            <div class="ask-question-col">
+              <div class="ask-q-label">
+                <span>2. message_end 到达时需要同步触发哪些动作？</span>
+                <span class="mono" style="font-size: 11px; color: var(--fg-muted);">多选 (Checkbox)</span>
+              </div>
+              <div class="ask-option selected">
+                <span class="check-box">✓</span>
+                <div class="opt-content">
+                  <div class="opt-title-row">
+                    <span>以 message_end 权威快照整体替换增量缓冲</span>
+                    <span class="rec-badge">推荐</span>
+                  </div>
+                  <div class="opt-desc">消除增量拼接可能遗漏的元数据字段</div>
+                </div>
+              </div>
+              <div class="ask-option selected">
+                <span class="check-box">✓</span>
+                <div class="opt-content">
+                  <div class="opt-title-row">
+                    <span>自动折叠未手动展开过的 Thinking 块</span>
+                  </div>
+                </div>
+              </div>
+              <div class="free-input-row">
+                <span>✎ 其他补充约束（自由输入）:</span>
+                <span class="mono" style="color: var(--fg-default);">保留 messageId 索引用于断线恢复</span>
+              </div>
+            </div>
+          </div>
+          <div class="ask-footer">
+            <span>回答将按 <span class="mono">answers[0..1]</span> 顺序回传给 <span class="mono">omp --mode rpc-ui</span></span>
+            <div class="btn-group">
+              <button class="btn">取消 <span class="kbd">Esc</span></button>
+              <button class="btn btn-primary">提交回答 (2/2) <span class="kbd" style="background: rgba(255,255,255,0.2); color: #fff; border: none;">⌘↵</span></button>
+            </div>
+          </div>
+        </div>
+
+        <!-- 队列 Chip + 底部输入框 -->
+        <div class="composer-dock">
+          <!-- 队列里一个 follow-up chip -->
+          <div class="queue-bar">
+            <div class="queue-chip-left">
+              <span class="chip-type-followup">FOLLOW-UP #1</span>
+              <span style="color: var(--fg-default); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">
+                接着用 <span class="mono">Client::from_io</span> 写一个假服务端单测，覆盖 <span class="mono">text_delta</span> 到 <span class="mono">message_end</span> 的完整对账
+              </span>
+            </div>
+            <div class="queue-actions">
+              <span class="chip-action-btn" style="color: var(--chip-steer-fg); border-color: var(--chip-steer-fg);">↑ 提升为 Steer (立即插队)</span>
+              <span class="chip-action-btn">✎ 编辑</span>
+              <span class="chip-action-btn">× 移除</span>
+            </div>
+          </div>
+
+          <!-- 多行输入框 Composer -->
+          <div class="composer-box">
+            <div class="composer-input">
+              <span>补充要求：测试里同时验证 <span class="ime-marked">未知帧解码</span> 为 <span class="mono">Event::Unknown</span> 时不会 panic</span>
+              <span class="mono" style="font-size: 11px; color: var(--fg-subtle);">中文 IME 正常</span>
+            </div>
+            <div class="composer-toolbar">
+              <div class="composer-tools-left">
+                <span class="pill-control">+ 图片/文件</span>
+                <span class="pill-control mono">/ 命令补全</span>
+                <span class="pill-control mono">claude-opus-5.5 ▾</span>
+                <span class="pill-control mono" style="color: var(--color-warning);">思考: High ▾</span>
+              </div>
+              <div class="btn-group">
+                <span class="mono tabular" style="white-space: nowrap;">~46 tok</span>
+                <button class="btn">追加 Follow-up <span class="kbd">↵</span></button>
+                <button class="btn" style="background: var(--chip-steer-bg); color: var(--chip-steer-fg); border-color: var(--chip-steer-fg);">立即 Steer <span class="kbd">⌥↵</span></button>
+                <button class="btn btn-danger">■ 停止 <span class="kbd">Esc</span></button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </main>
+
+      <!-- 右侧监控栏（Todo & Subagents） -->
+      <aside class="inspector-pane">
+        <div class="panel-block">
+          <div class="panel-title-row">
+            <span>TODO 进度 (M0 / M1)</span>
+            <span class="mono tabular">2 / 4 完成</span>
+          </div>
+          <div class="todo-list">
+            <div class="todo-item todo-done">
+              <span>☑</span>
+              <span>Sparse 检出 vendor/omp-rpc (v18.13.3)</span>
+            </div>
+            <div class="todo-item todo-done">
+              <span>☑</span>
+              <span>实现 SetEventFilterDelta 命令与握手</span>
+            </div>
+            <div class="todo-item todo-active">
+              <span style="color: var(--color-primary);">▶</span>
+              <span>编写 omp-store 增量消息重建状态机</span>
+            </div>
+            <div class="todo-item" style="color: var(--fg-muted);">
+              <span>☐</span>
+              <span>补齐 Client::from_io 脚本化假服务端测试</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel-block" style="flex: 1; border-bottom: none;">
+          <div class="panel-title-row">
+            <span>并发子 AGENT (SUBAGENTS)</span>
+            <span class="tab-badge badge-streaming mono tabular">2 运行中</span>
+          </div>
+
+          <div class="subagent-card">
+            <div class="subagent-top">
+              <span class="mono" style="color: var(--color-primary);">● scout · 扫描 wire.rs</span>
+              <span class="mono tabular" style="font-size: 11px; color: var(--fg-muted);">12.4s</span>
+            </div>
+            <div style="font-size: 11px; color: var(--fg-muted);">核对 AgentMessage 与 Event 枚举定义</div>
+            <div class="subagent-log">grep "RpcNotification" vendor/omp-rpc/src/wire.rs</div>
+            <div class="subagent-actions">
+              <span class="chip-action-btn">Steer 干预</span>
+              <span class="chip-action-btn" style="color: var(--color-danger);">× 取消 (Kill)</span>
+            </div>
+          </div>
+
+          <div class="subagent-card">
+            <div class="subagent-top">
+              <span class="mono" style="color: var(--color-primary);">● task · 构造测试夹具</span>
+              <span class="mono tabular" style="font-size: 11px; color: var(--fg-muted);">08.1s</span>
+            </div>
+            <div style="font-size: 11px; color: var(--fg-muted);">生成 delta JSONL 回放样本流</div>
+            <div class="subagent-log">write crates/omp-store/tests/fixtures/delta.jsonl</div>
+            <div class="subagent-actions">
+              <span class="chip-action-btn">Steer 干预</span>
+              <span class="chip-action-btn" style="color: var(--color-danger);">× 取消 (Kill)</span>
+            </div>
+          </div>
+        </div>
+      </aside>
+    </div>
+
+    <!-- 底部状态栏 26px -->
+    <footer class="statusbar mono tabular">
+      <div class="status-group">
+        <div class="status-item">
+          <span class="status-dot dot-settled"></span>
+          <span>rpc-ui v2 (delta) · PID 48291</span>
+        </div>
+        <div class="status-item">
+          <span>模型: <strong>auto/claude-opus-5.5</strong></span>
+        </div>
+        <div class="status-item">
+          <span>思考档位: <strong style="color: var(--color-warning);">High</strong></span>
+        </div>
+      </div>
+      <div class="status-group">
+        <div class="status-item">
+          <span>上下文: 42% (84.2k / 200k)</span>
+          <div class="ctx-meter"><div class="ctx-fill" style="width: 42%;"></div></div>
+        </div>
+        <div class="status-item">
+          <span>费用: <strong>$0.184</strong></span>
+        </div>
+        <div class="status-item">
+          <span>☑ Todo: 2/4</span>
+        </div>
+        <div class="status-item" style="color: var(--fg-accent);">
+          <span>⑂ Subagents: 2 活跃</span>
+        </div>
+      </div>
+    </footer>
+  </section>
+
+  <!-- ==========================================================================
+       SECTION 2: #main-dark（暗色主题主视图：完整对应亮色版结构与暗色语义 Token）
+       ========================================================================== -->
+  <section id="main-dark" class="screen-frame theme-dark">
+    <header class="titlebar">
+      <div class="titlebar-left">
+        <div class="traffic-lights">
+          <span class="traffic-dot traffic-close"></span>
+          <span class="traffic-dot traffic-min"></span>
+          <span class="traffic-dot traffic-max"></span>
+        </div>
+        <div class="tab-strip">
+          <div class="tab-item active">
+            <span class="status-dot dot-streaming"></span>
+            <span>omp-desktop · 实现增量消息重建</span>
+            <span class="tab-badge badge-streaming mono">流式中 · 待确认</span>
+            <span class="tab-close">×</span>
+          </div>
+          <div class="tab-item">
+            <span class="status-dot dot-settled"></span>
+            <span>oh-my-pi · 核对 v18.13.3 wire.rs</span>
+            <span class="tab-close">×</span>
+          </div>
+          <div class="tab-item">
+            <span class="status-dot dot-danger"></span>
+            <span>trainpal-crn · 详情页预加载</span>
+            <span class="tab-badge badge-danger">已断开</span>
+            <span class="tab-close">×</span>
+          </div>
+          <div class="tab-add-btn">+</div>
+        </div>
+      </div>
+      <div class="titlebar-right">
+        <div class="toolbar-btn">
+          <span>暗色主题 (Dark)</span>
+        </div>
+        <div class="toolbar-btn">
+          <span>左侧栏</span>
+          <span class="kbd">⌘B</span>
+        </div>
+        <div class="toolbar-btn">
+          <span>子 Agent 监控</span>
+          <span class="kbd">⌘J</span>
+        </div>
+      </div>
+    </header>
+
+    <div class="workspace">
+      <aside class="sidebar">
+        <div class="sidebar-header">
+          <div class="search-box">
+            <span>搜索会话或项目路径...</span>
+            <span class="kbd">⌘P</span>
+          </div>
+        </div>
+        <div class="sidebar-section">
+          <div class="cwd-group-header">
+            <span class="mono">~/Project/omp-desktop</span>
+            <span class="tabular">3</span>
+          </div>
+          <div class="session-item selected">
+            <div class="session-item-top">
+              <span class="session-title">实现增量消息重建与 SetEventFilterDelta</span>
+              <span class="session-time tabular">刚刚</span>
+            </div>
+            <div class="session-item-sub">
+              <span class="mono">#8f3a · PID 48291</span>
+              <span style="color: var(--fg-accent); font-weight: 600;">当前 Tab</span>
+            </div>
+          </div>
+          <div class="session-item">
+            <div class="session-item-top">
+              <span class="session-title">调研 gpui-kit 0.7 虚拟列表与中文 IME</span>
+              <span class="session-time tabular">42m</span>
+            </div>
+            <div class="session-item-sub">
+              <span class="mono">#4c19 · 28 条消息</span>
+              <span>已归档</span>
+            </div>
+          </div>
+          <div class="session-item">
+            <div class="session-item-top">
+              <span class="session-title">稀疏检出 vendor/omp-rpc v18.13.3</span>
+              <span class="session-time tabular">3h</span>
+            </div>
+            <div class="session-item-sub">
+              <span class="mono">#19b0 · 14 条消息</span>
+              <span>v2</span>
+            </div>
+          </div>
+
+          <div class="cwd-group-header" style="margin-top: 10px;">
+            <span class="mono">~/Project/oh-my-pi</span>
+            <span class="tabular">2</span>
+          </div>
+          <div class="session-item">
+            <div class="session-item-top">
+              <span class="session-title">对比 v18.13.3 与 main 分支 wire.rs 差异</span>
+              <span class="session-time tabular">昨天</span>
+            </div>
+            <div class="session-item-sub">
+              <span class="mono">#9e21 · PID 48310</span>
+              <span style="color: var(--color-success);">Tab 2 运行中</span>
+            </div>
+          </div>
+          <div class="session-item">
+            <div class="session-item-top">
+              <span class="session-title">验证 rpc-ui 模式下 set_ask_dialog 协议</span>
+              <span class="session-time tabular">10-27</span>
+            </div>
+            <div class="session-item-sub">
+              <span class="mono">#7d04 · 19 条消息</span>
+              <span>v2</span>
+            </div>
+          </div>
+        </div>
+        <div class="sidebar-footer">
+          <span class="mono">~/.omp/agent/sessions</span>
+          <span class="tabular">共 5 个会话</span>
+        </div>
+      </aside>
+
+      <main class="main-pane">
+        <div class="session-subheader">
+          <div class="subheader-left">
+            <span class="mono" style="color: var(--fg-default); font-weight: 500;">~/Project/omp-desktop</span>
+            <span>·</span>
+            <span class="mono">git: feat/omp-bridge-delta</span>
+            <span>·</span>
+            <span class="mono">session: 2026-10-29_8f3a.jsonl</span>
+          </div>
+          <div class="subheader-right">
+            <span class="pill-control mono">Fork 分支</span>
+            <span class="pill-control mono">Compact 压缩</span>
+          </div>
+        </div>
+
+        <div class="chat-scroll">
+          <div class="msg-user">
+            <div class="msg-meta">
+              <span><strong>你 (User)</strong> · 14:22:08</span>
+              <span class="mono">#msg_01 · [Fork] [编辑]</span>
+            </div>
+            <div class="msg-user-body">
+              在 <span class="inline-code">crates/omp-bridge/src/filter.rs</span> 里补齐 <span class="inline-code">SetEventFilterDelta</span> 命令，开启 <span class="inline-code">messageUpdates: "delta"</span>，并在 <span class="inline-code">omp-store</span> 中处理增量回退兼容。
+            </div>
+          </div>
+
+          <div class="msg-assistant">
+            <div class="thinking-block">
+              <span>▸ <strong>思考过程 (Thinking)</strong> · 已核对 omp-rpc Command trait 签名与 data.messageUpdates 降级分支</span>
+              <span class="mono tabular">3.4s · 620 tokens</span>
+            </div>
+
+            <div class="tool-card">
+              <div class="tool-card-header">
+                <div class="tool-header-left">
+                  <span class="tool-tag">edit</span>
+                  <span class="mono" style="font-weight: 500;">crates/omp-bridge/src/filter.rs</span>
+                  <span class="mono" style="color: var(--fg-subtle);">[#3F8A]</span>
+                  <span class="mono diff-stat-add tabular">+14</span>
+                  <span class="mono diff-stat-del tabular">-3</span>
+                </div>
+                <div class="btn-group">
+                  <span class="mono" style="font-size: 11px; color: var(--color-success);">✓ 已应用 · 18ms</span>
+                  <span class="pill-control mono">Unified</span>
+                </div>
+              </div>
+              <table class="diff-table">
+                <tbody>
+                  <tr class="diff-row">
+                    <td class="diff-ln">12</td>
+                    <td class="diff-ln">12</td>
+                    <td class="diff-sign"> </td>
+                    <td>use omp_rpc::wire::{Command, SetEventFilterCommand};</td>
+                  </tr>
+                  <tr class="diff-row del">
+                    <td class="diff-ln">13</td>
+                    <td class="diff-ln"></td>
+                    <td class="diff-sign">-</td>
+                    <td>pub fn enable_event_stream(client: &amp;Client) -&gt; Result&lt;(), Error&gt; {</td>
+                  </tr>
+                  <tr class="diff-row del">
+                    <td class="diff-ln">14</td>
+                    <td class="diff-ln"></td>
+                    <td class="diff-sign">-</td>
+                    <td>    client.call(<span class="word-hl-del">SetEventFilterCommand { events: None }</span>).map(|_| ())</td>
+                  </tr>
+                  <tr class="diff-row add">
+                    <td class="diff-ln"></td>
+                    <td class="diff-ln">13</td>
+                    <td class="diff-sign">+</td>
+                    <td>#[derive(Serialize)]</td>
+                  </tr>
+                  <tr class="diff-row add">
+                    <td class="diff-ln"></td>
+                    <td class="diff-ln">14</td>
+                    <td class="diff-sign">+</td>
+                    <td>pub struct <span class="word-hl-add">SetEventFilterDelta</span> { pub events: Option&lt;Vec&lt;String&gt;&gt;, pub <span class="word-hl-add">message_updates: &amp;'static str</span> }</td>
+                  </tr>
+                  <tr class="diff-row add">
+                    <td class="diff-ln"></td>
+                    <td class="diff-ln">15</td>
+                    <td class="diff-sign">+</td>
+                    <td>pub fn enable_delta_stream(client: &amp;Client) -&gt; Result&lt;StreamMode, Error&gt; {</td>
+                  </tr>
+                  <tr class="diff-row add">
+                    <td class="diff-ln"></td>
+                    <td class="diff-ln">16</td>
+                    <td class="diff-sign">+</td>
+                    <td>    let resp = client.call(SetEventFilterDelta { events: None, <span class="word-hl-add">message_updates: "delta"</span> })?;</td>
+                  </tr>
+                  <tr class="diff-row">
+                    <td class="diff-ln">15</td>
+                    <td class="diff-ln">17</td>
+                    <td class="diff-sign"> </td>
+                    <td>}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <div class="assistant-prose">
+              已完成 <span class="inline-code">SetEventFilterDelta</span> 结构体定义并验证了 <span class="inline-code">data.messageUpdates == "delta"</span> 的握手判断。接下来在编写 <span class="inline-code">omp-store</span> 的消息重建状态机前，需要确认两个边界策略：<span class="streaming-cursor"></span>
+            </div>
+          </div>
+        </div>
+
+        <div class="ask-dialog-card">
+          <div class="ask-header">
+            <div class="ask-title">
+              <span>● Agent 询问实现细节 (extension_ui_request · ask)</span>
+              <span class="mono" style="font-weight: 400; color: var(--fg-muted);">id: req_ask_902</span>
+            </div>
+            <span class="mono" style="font-size: 11px; color: var(--fg-muted);">支持数字键 1-3 快选 · Esc 取消</span>
+          </div>
+          <div class="ask-body">
+            <div class="ask-question-col">
+              <div class="ask-q-label">
+                <span>1. 旧版 omp 不支持 delta 时的回退行为？</span>
+                <span class="mono" style="font-size: 11px; color: var(--fg-muted);">单选 (Radio)</span>
+              </div>
+              <div class="ask-option selected">
+                <span class="radio-dot">●</span>
+                <div class="opt-content">
+                  <div class="opt-title-row">
+                    <span>自动回退完整快照并记录状态栏告警</span>
+                    <span class="rec-badge">推荐</span>
+                  </div>
+                  <div class="opt-desc">当响应无 data.messageUpdates == "delta" 时无缝切回全量覆盖</div>
+                </div>
+              </div>
+              <div class="ask-option">
+                <span class="radio-dot"></span>
+                <div class="opt-content">
+                  <div class="opt-title-row">
+                    <span>严格阻断连接并要求升级 omp</span>
+                  </div>
+                  <div class="opt-desc">仅允许支持 delta 增量流的 omp 进程建立会话</div>
+                </div>
+              </div>
+            </div>
+
+            <div class="ask-question-col">
+              <div class="ask-q-label">
+                <span>2. message_end 到达时需要同步触发哪些动作？</span>
+                <span class="mono" style="font-size: 11px; color: var(--fg-muted);">多选 (Checkbox)</span>
+              </div>
+              <div class="ask-option selected">
+                <span class="check-box">✓</span>
+                <div class="opt-content">
+                  <div class="opt-title-row">
+                    <span>以 message_end 权威快照整体替换增量缓冲</span>
+                    <span class="rec-badge">推荐</span>
+                  </div>
+                  <div class="opt-desc">消除增量拼接可能遗漏的元数据字段</div>
+                </div>
+              </div>
+              <div class="ask-option selected">
+                <span class="check-box">✓</span>
+                <div class="opt-content">
+                  <div class="opt-title-row">
+                    <span>自动折叠未手动展开过的 Thinking 块</span>
+                  </div>
+                </div>
+              </div>
+              <div class="free-input-row">
+                <span>✎ 其他补充约束（自由输入）:</span>
+                <span class="mono" style="color: var(--fg-default);">保留 messageId 索引用于断线恢复</span>
+              </div>
+            </div>
+          </div>
+          <div class="ask-footer">
+            <span>回答将按 <span class="mono">answers[0..1]</span> 顺序回传给 <span class="mono">omp --mode rpc-ui</span></span>
+            <div class="btn-group">
+              <button class="btn">取消 <span class="kbd">Esc</span></button>
+              <button class="btn btn-primary">提交回答 (2/2) <span class="kbd" style="background: rgba(255,255,255,0.2); color: #fff; border: none;">⌘↵</span></button>
+            </div>
+          </div>
+        </div>
+
+        <div class="composer-dock">
+          <div class="queue-bar">
+            <div class="queue-chip-left">
+              <span class="chip-type-followup">FOLLOW-UP #1</span>
+              <span style="color: var(--fg-default); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">
+                接着用 <span class="mono">Client::from_io</span> 写一个假服务端单测，覆盖 <span class="mono">text_delta</span> 到 <span class="mono">message_end</span> 的完整对账
+              </span>
+            </div>
+            <div class="queue-actions">
+              <span class="chip-action-btn" style="color: var(--chip-steer-fg); border-color: var(--chip-steer-fg);">↑ 提升为 Steer (立即插队)</span>
+              <span class="chip-action-btn">✎ 编辑</span>
+              <span class="chip-action-btn">× 移除</span>
+            </div>
+          </div>
+
+          <div class="composer-box">
+            <div class="composer-input">
+              <span>补充要求：测试里同时验证 <span class="ime-marked">未知帧解码</span> 为 <span class="mono">Event::Unknown</span> 时不会 panic</span>
+              <span class="mono" style="font-size: 11px; color: var(--fg-subtle);">中文 IME 正常</span>
+            </div>
+            <div class="composer-toolbar">
+              <div class="composer-tools-left">
+                <span class="pill-control">+ 图片/文件</span>
+                <span class="pill-control mono">/ 命令补全</span>
+                <span class="pill-control mono">claude-opus-5.5 ▾</span>
+                <span class="pill-control mono" style="color: var(--color-warning);">思考: High ▾</span>
+              </div>
+              <div class="btn-group">
+                <span class="mono tabular" style="white-space: nowrap;">~46 tok</span>
+                <button class="btn">追加 Follow-up <span class="kbd">↵</span></button>
+                <button class="btn" style="background: var(--chip-steer-bg); color: var(--chip-steer-fg); border-color: var(--chip-steer-fg);">立即 Steer <span class="kbd">⌥↵</span></button>
+                <button class="btn btn-danger">■ 停止 <span class="kbd">Esc</span></button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </main>
+
+      <aside class="inspector-pane">
+        <div class="panel-block">
+          <div class="panel-title-row">
+            <span>TODO 进度 (M0 / M1)</span>
+            <span class="mono tabular">2 / 4 完成</span>
+          </div>
+          <div class="todo-list">
+            <div class="todo-item todo-done">
+              <span>☑</span>
+              <span>Sparse 检出 vendor/omp-rpc (v18.13.3)</span>
+            </div>
+            <div class="todo-item todo-done">
+              <span>☑</span>
+              <span>实现 SetEventFilterDelta 命令与握手</span>
+            </div>
+            <div class="todo-item todo-active">
+              <span style="color: var(--color-primary);">▶</span>
+              <span>编写 omp-store 增量消息重建状态机</span>
+            </div>
+            <div class="todo-item" style="color: var(--fg-muted);">
+              <span>☐</span>
+              <span>补齐 Client::from_io 脚本化假服务端测试</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel-block" style="flex: 1; border-bottom: none;">
+          <div class="panel-title-row">
+            <span>并发子 AGENT (SUBAGENTS)</span>
+            <span class="tab-badge badge-streaming mono tabular">2 运行中</span>
+          </div>
+
+          <div class="subagent-card">
+            <div class="subagent-top">
+              <span class="mono" style="color: var(--fg-accent);">● scout · 扫描 wire.rs</span>
+              <span class="mono tabular" style="font-size: 11px; color: var(--fg-muted);">12.4s</span>
+            </div>
+            <div style="font-size: 11px; color: var(--fg-muted);">核对 AgentMessage 与 Event 枚举定义</div>
+            <div class="subagent-log">grep "RpcNotification" vendor/omp-rpc/src/wire.rs</div>
+            <div class="subagent-actions">
+              <span class="chip-action-btn">Steer 干预</span>
+              <span class="chip-action-btn" style="color: var(--color-danger);">× 取消 (Kill)</span>
+            </div>
+          </div>
+
+          <div class="subagent-card">
+            <div class="subagent-top">
+              <span class="mono" style="color: var(--fg-accent);">● task · 构造测试夹具</span>
+              <span class="mono tabular" style="font-size: 11px; color: var(--fg-muted);">08.1s</span>
+            </div>
+            <div style="font-size: 11px; color: var(--fg-muted);">生成 delta JSONL 回放样本流</div>
+            <div class="subagent-log">write crates/omp-store/tests/fixtures/delta.jsonl</div>
+            <div class="subagent-actions">
+              <span class="chip-action-btn">Steer 干预</span>
+              <span class="chip-action-btn" style="color: var(--color-danger);">× 取消 (Kill)</span>
+            </div>
+          </div>
+        </div>
+      </aside>
+    </div>
+
+    <footer class="statusbar mono tabular">
+      <div class="status-group">
+        <div class="status-item">
+          <span class="status-dot dot-settled"></span>
+          <span>rpc-ui v2 (delta) · PID 48291</span>
+        </div>
+        <div class="status-item">
+          <span>模型: <strong>auto/claude-opus-5.5</strong></span>
+        </div>
+        <div class="status-item">
+          <span>思考档位: <strong style="color: var(--color-warning);">High</strong></span>
+        </div>
+      </div>
+      <div class="status-group">
+        <div class="status-item">
+          <span>上下文: 42% (84.2k / 200k)</span>
+          <div class="ctx-meter"><div class="ctx-fill" style="width: 42%;"></div></div>
+        </div>
+        <div class="status-item">
+          <span>费用: <strong>$0.184</strong></span>
+        </div>
+        <div class="status-item">
+          <span>☑ Todo: 2/4</span>
+        </div>
+        <div class="status-item" style="color: var(--fg-accent);">
+          <span>⑂ Subagents: 2 活跃</span>
+        </div>
+      </div>
+    </footer>
+  </section>
+
+  <!-- ==========================================================================
+       SECTION 3: #empty（新建会话空状态 + Slash 命令补全浮层预览）
+       ========================================================================== -->
+  <section id="empty" class="screen-frame theme-light">
+    <header class="titlebar">
+      <div class="titlebar-left">
+        <div class="traffic-lights">
+          <span class="traffic-dot traffic-close"></span>
+          <span class="traffic-dot traffic-min"></span>
+          <span class="traffic-dot traffic-max"></span>
+        </div>
+        <div class="tab-strip">
+          <div class="tab-item active">
+            <span class="status-dot dot-settled"></span>
+            <span>新会话 · omp-desktop</span>
+            <span class="tab-close">×</span>
+          </div>
+          <div class="tab-add-btn">+</div>
+        </div>
+      </div>
+      <div class="titlebar-right">
+        <div class="toolbar-btn"><span>左侧栏</span><span class="kbd">⌘B</span></div>
+      </div>
+    </header>
+
+    <div class="workspace">
+      <aside class="sidebar">
+        <div class="sidebar-header">
+          <div class="search-box">
+            <span>搜索会话或项目路径...</span>
+            <span class="kbd">⌘P</span>
+          </div>
+        </div>
+        <div class="sidebar-section">
+          <div class="cwd-group-header">
+            <span class="mono">~/Project/omp-desktop</span>
+            <span class="tabular">3</span>
+          </div>
+          <div class="session-item">
+            <div class="session-item-top">
+              <span class="session-title">实现增量消息重建与 SetEventFilterDelta</span>
+              <span class="session-time tabular">15m</span>
+            </div>
+            <div class="session-item-sub">
+              <span class="mono">#8f3a · 16 条消息</span>
+              <span>v2</span>
+            </div>
+          </div>
+          <div class="session-item">
+            <div class="session-item-top">
+              <span class="session-title">调研 gpui-kit 0.7 虚拟列表与中文 IME</span>
+              <span class="session-time tabular">1h</span>
+            </div>
+            <div class="session-item-sub">
+              <span class="mono">#4c19 · 28 条消息</span>
+              <span>v2</span>
+            </div>
+          </div>
+        </div>
+        <div class="sidebar-footer">
+          <span class="mono">~/.omp/agent/sessions</span>
+          <span class="tabular">已就绪</span>
+        </div>
+      </aside>
+
+      <main class="main-pane">
+        <div class="empty-stage">
+          <div class="empty-container">
+            <div>
+              <div style="font-size: 18px; font-weight: 600; margin-bottom: 6px;">omp-desktop 工作台已就绪</div>
+              <div class="mono" style="font-size: 12px; color: var(--fg-muted);">
+                工作区: /Users/yangchengxxyy/Project/omp-desktop · 分支: main · 进程: omp v18.13.3 (rpc-ui v2)
+              </div>
+            </div>
+
+            <div class="quick-grid">
+              <div class="quick-card">
+                <div style="font-weight: 600; font-size: 13px; display: flex; justify-content: space-between;">
+                  <span>审查当前未提交的 Git 变更</span>
+                  <span class="kbd">/diff</span>
+                </div>
+                <div style="font-size: 12px; color: var(--fg-muted);">拉取工作区 diff 并检查潜在并发与内存开销问题</div>
+              </div>
+              <div class="quick-card">
+                <div style="font-weight: 600; font-size: 13px; display: flex; justify-content: space-between;">
+                  <span>恢复最近会话 (#8f3a)</span>
+                  <span class="kbd">⌘⇧T</span>
+                </div>
+                <div style="font-size: 12px; color: var(--fg-muted);">继续“实现增量消息重建与 SetEventFilterDelta”</div>
+              </div>
+              <div class="quick-card">
+                <div style="font-weight: 600; font-size: 13px; display: flex; justify-content: space-between;">
+                  <span>派发 Scout 子 Agent 探索代码库</span>
+                  <span class="kbd">@scout</span>
+                </div>
+                <div style="font-size: 12px; color: var(--fg-muted);">并发只读检索符号、引用链与模块边界</div>
+              </div>
+              <div class="quick-card">
+                <div style="font-weight: 600; font-size: 13px; display: flex; justify-content: space-between;">
+                  <span>切换推理模型与思考预算</span>
+                  <span class="kbd">⌘M</span>
+                </div>
+                <div style="font-size: 12px; color: var(--fg-muted);">当前：auto/claude-opus-5.5 · 思考档位：High</div>
+              </div>
+            </div>
+
+            <div style="display: flex; gap: 16px; font-size: 12px; color: var(--fg-muted); border-top: 1px solid var(--border-default); padding-top: 12px;">
+              <span><span class="kbd">⌘N</span> 新建进程 Tab</span>
+              <span><span class="kbd">⌘P</span> 搜索历史会话</span>
+              <span><span class="kbd">/</span> 触发命令补全 (available_commands_update)</span>
+              <span><span class="kbd">⌘V</span> 直接粘贴剪贴板截图</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="composer-dock">
+          <div class="composer-box">
+            <div class="composer-input" style="color: var(--fg-subtle);">
+              <span>输入任务描述，输入 / 唤起命令补全，或粘贴报错截图...</span>
+              <span class="kbd">↵ 发送</span>
+            </div>
+            <div class="composer-toolbar">
+              <div class="composer-tools-left">
+                <span class="pill-control">+ 图片/文件</span>
+                <span class="pill-control mono">/ 命令补全</span>
+                <span class="pill-control mono">模型: auto/claude-opus-5.5 ▾</span>
+                <span class="pill-control mono">思考: High ▾</span>
+              </div>
+              <button class="btn btn-primary">发送消息 <span class="kbd" style="background: rgba(255,255,255,0.2); color: #fff; border: none;">↵</span></button>
+            </div>
+          </div>
+        </div>
+      </main>
+    </div>
+
+    <footer class="statusbar mono tabular">
+      <div class="status-group">
+        <div class="status-item"><span class="status-dot dot-settled"></span><span>已空闲 (Settled) · PID 48502</span></div>
+        <div class="status-item"><span>模型: <strong>auto/claude-opus-5.5</strong></span></div>
+      </div>
+      <div class="status-group">
+        <div class="status-item"><span>上下文: 0% (0 / 200k)</span></div>
+        <div class="status-item"><span>费用: <strong>$0.000</strong></span></div>
+      </div>
+    </footer>
+  </section>
+
+  <!-- ==========================================================================
+       SECTION 4: #disconnected（进程意外退出 Error::Closed 断线重连态）
+       ========================================================================== -->
+  <section id="disconnected" class="screen-frame theme-light">
+    <header class="titlebar">
+      <div class="titlebar-left">
+        <div class="traffic-lights">
+          <span class="traffic-dot traffic-close"></span>
+          <span class="traffic-dot traffic-min"></span>
+          <span class="traffic-dot traffic-max"></span>
+        </div>
+        <div class="tab-strip">
+          <div class="tab-item active">
+            <span class="status-dot dot-danger"></span>
+            <span>trainpal-crn · 详情页预加载 [已断开]</span>
+            <span class="tab-badge badge-danger">Error::Closed</span>
+            <span class="tab-close">×</span>
+          </div>
+          <div class="tab-item">
+            <span class="status-dot dot-settled"></span>
+            <span>omp-desktop · 实现增量消息重建</span>
+            <span class="tab-close">×</span>
+          </div>
+        </div>
+      </div>
+    </header>
+
+    <div class="workspace">
+      <aside class="sidebar">
+        <div class="sidebar-header">
+          <div class="search-box"><span>搜索会话...</span><span class="kbd">⌘P</span></div>
+        </div>
+        <div class="sidebar-section">
+          <div class="cwd-group-header"><span class="mono">~/Project/trainpal-crn</span><span>1</span></div>
+          <div class="session-item selected">
+            <div class="session-item-top">
+              <span class="session-title">排查酒店详情页预加载缓存命中率</span>
+              <span class="session-time">12m</span>
+            </div>
+            <div class="session-item-sub">
+              <span class="mono">#6a12 · 进程已退出</span>
+              <span style="color: var(--color-danger); font-weight: 600;">需要重连</span>
+            </div>
+          </div>
+        </div>
+      </aside>
+
+      <main class="main-pane">
+        <!-- 断线重连横幅 -->
+        <div class="disconnect-banner">
+          <div style="display: flex; flex-direction: column; gap: 3px;">
+            <div style="font-weight: 600; font-size: 13px;">
+              ▲ omp 子进程连接已断开 (Error::Closed · 原 PID 47109 收到 SIGTERM 退出)
+            </div>
+            <div class="mono" style="font-size: 11px;">
+              会话已持久化至 ~/.omp/agent/sessions/trainpal-crn/2026-10-29_6a12.jsonl · 独立进程组的后台任务不受影响
+            </div>
+          </div>
+          <div class="btn-group">
+            <button class="btn">查看 stderr 日志</button>
+            <button class="btn btn-primary">↻ 立即重连 (--resume) <span class="kbd" style="background: rgba(255,255,255,0.2); color: #fff; border: none;">⌘R</span></button>
+          </div>
+        </div>
+
+        <div class="chat-scroll">
+          <div class="msg-user">
+            <div class="msg-meta"><span><strong>你 (User)</strong> · 13:58:10</span><span class="mono">#msg_04</span></div>
+            <div class="msg-user-body">运行预加载回归脚本并检查 checkInDate 序列化格式是否与原生一致。</div>
+          </div>
+
+          <div class="msg-assistant">
+            <div class="tool-card">
+              <div class="tool-card-header">
+                <div class="tool-header-left">
+                  <span class="tool-tag">bash</span>
+                  <span class="mono">$ bun test src/prefetch/__tests__/cacheKey.spec.ts</span>
+                </div>
+                <span class="tab-badge badge-danger mono">流式中断 (进程退出)</span>
+              </div>
+              <div class="mono" style="padding: 10px 12px; background: var(--bg-code); font-size: 12px; color: var(--fg-muted);">
+                ✓ cacheKey matches iOS native snapshot [14ms]<br/>
+                ⋯ 正在汇总覆盖率报告时子进程通道关闭 (EOF)
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 禁用态输入框 -->
+        <div class="composer-dock" style="opacity: 0.72;">
+          <div class="composer-box">
+            <div class="composer-input" style="color: var(--fg-subtle);">
+              <span>当前 Tab 绑定的 omp 进程已断开。请按 ⌘R 或点击上方“立即重连”以 --resume 恢复会话...</span>
+            </div>
+            <div class="composer-toolbar">
+              <div class="composer-tools-left">
+                <span class="pill-control mono">状态: Disconnected</span>
+              </div>
+              <button class="btn btn-primary">↻ 重新拉起进程并恢复会话 <span class="kbd" style="background: rgba(255,255,255,0.2); color: #fff; border: none;">⌘R</span></button>
+            </div>
+          </div>
+        </div>
+      </main>
+    </div>
+
+    <footer class="statusbar mono tabular">
+      <div class="status-group">
+        <div class="status-item" style="color: var(--color-danger);">
+          <span class="status-dot dot-danger"></span>
+          <span>已断开 (Error::Closed) · 等待重连</span>
+        </div>
+      </div>
+      <div class="status-group">
+        <div class="status-item"><span>历史消息已完整保留</span></div>
+      </div>
+    </footer>
+  </section>
+
+  <!-- ==========================================================================
+       SECTION 5: #onboarding-error（首次启动环境检测：未安装 / 版本过低 / 协议不支持 v2）
+       ========================================================================== -->
+  <section id="onboarding-error" class="screen-frame theme-light">
+    <header class="titlebar">
+      <div class="titlebar-left">
+        <div class="traffic-lights">
+          <span class="traffic-dot traffic-close"></span>
+          <span class="traffic-dot traffic-min"></span>
+          <span class="traffic-dot traffic-max"></span>
+        </div>
+        <div class="tab-strip">
+          <div class="tab-item active">
+            <span class="status-dot dot-danger"></span>
+            <span>环境与协议兼容性自检</span>
+          </div>
+        </div>
+      </div>
+    </header>
+
+    <div class="onboarding-stage">
+      <div class="diag-panel">
+        <div class="diag-header">
+          <div>
+            <div style="font-size: 18px; font-weight: 600;">无法启动 omp-desktop 会话引擎</div>
+            <div style="font-size: 12px; color: var(--fg-muted); margin-top: 2px;">
+              客户端在启动时执行了 <span class="mono">omp --version</span> 与 <span class="mono">rpc-ui</span> 协议握手校验，发现以下环境问题：
+            </div>
+          </div>
+          <span class="tab-badge badge-danger mono" style="padding: 4px 8px;">阻塞项: 3 类异常</span>
+        </div>
+
+        <div class="diag-list">
+          <!-- 诊断项 1：未安装 / 找不到可执行文件 -->
+          <div class="diag-item">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+              <strong style="font-size: 13.5px;">1. 未找到 omp 可执行文件 (Binary Not Found)</strong>
+              <span class="mono" style="font-size: 11px; color: var(--color-danger);">PATH 检索失败</span>
+            </div>
+            <div style="font-size: 12px; color: var(--fg-muted);">
+              在 <span class="mono">/opt/homebrew/bin/omp</span>、<span class="mono">/usr/local/bin/omp</span> 与 <span class="mono">~/.cargo/bin/omp</span> 中均未定位到二进制文件。
+            </div>
+            <div class="cmd-snippet">
+              <span>$ brew install can1357/tap/omp &nbsp;&nbsp;# 或在设置中手动指定二进制绝对路径</span>
+              <span class="btn" style="height: 22px; font-size: 11px;">复制命令</span>
+            </div>
+          </div>
+
+          <!-- 诊断项 2：版本过低 -->
+          <div class="diag-item warn">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+              <strong style="font-size: 13.5px;">2. 已安装的 omp 版本过低 (当前: v17.4.0 · 要求: ≥ v18.13.3)</strong>
+              <span class="mono" style="font-size: 11px; color: var(--color-warning);">wire.rs 绑定 v18.13.3</span>
+            </div>
+            <div style="font-size: 12px; color: var(--fg-muted);">
+              当前客户端内嵌的 <span class="mono">vendor/omp-rpc</span> 协议定义生成自 tag <span class="mono">v18.13.3 (413d278)</span>，旧版缺少增量流字段。
+            </div>
+            <div class="cmd-snippet">
+              <span>$ omp update &nbsp;&nbsp;# 升级至 v18.13.3 或更高兼容版本</span>
+              <span class="btn" style="height: 22px; font-size: 11px;">复制升级命令</span>
+            </div>
+          </div>
+
+          <!-- 诊断项 3：协议不支持 v2 -->
+          <div class="diag-item">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+              <strong style="font-size: 13.5px;">3. 握手响应不支持 Protocol v2 (Protocol Version Unsupported)</strong>
+              <span class="mono" style="font-size: 11px; color: var(--color-danger);">supportedProtocolVersions: [1]</span>
+            </div>
+            <div style="font-size: 12px; color: var(--fg-muted);">
+              <span class="mono">ready.supportedProtocolVersions</span> 不包含 <span class="mono">2</span>，客户端拒绝回退 v1（依赖 v2 的 <span class="mono">get_messages</span> 自动分页与 <span class="mono">rpc_chunk</span> 重组）。
+            </div>
+          </div>
+        </div>
+
+        <div class="ask-footer" style="height: 44px; padding: 0 24px;">
+          <span class="mono">检测路径: /opt/homebrew/bin/omp</span>
+          <div class="btn-group">
+            <button class="btn">手动选择 omp 路径...</button>
+            <button class="btn btn-primary">↻ 重新检测环境 <span class="kbd" style="background: rgba(255,255,255,0.2); color: #fff; border: none;">⌘R</span></button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <footer class="statusbar mono tabular">
+      <div class="status-group">
+        <div class="status-item" style="color: var(--color-danger);">
+          <span class="status-dot dot-danger"></span>
+          <span>握手校验未通过 · 等待升级或指定 omp v18.13.3+</span>
+        </div>
+      </div>
+    </footer>
+  </section>
+
+</body>
+</html>
