@@ -1,0 +1,19 @@
+[workspace]
+resolver = "3"
+members = ["crates/omp-bridge", "crates/omp-store"]
+# Vendored upstream crate declares its own [workspace]; keep it out of ours.
+exclude = ["vendor/omp-rpc"]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "MIT"
+publish = false
+
+[workspace.dependencies]
+omp-rpc = { path = "vendor/omp-rpc" }
+omp-bridge = { path = "crates/omp-bridge" }
+omp-store = { path = "crates/omp-store" }
+async-channel = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

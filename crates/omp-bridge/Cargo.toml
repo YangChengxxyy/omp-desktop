@@ -1,0 +1,16 @@
+[package]
+name = "omp-bridge"
+description = "Spawns `omp --mode rpc-ui`, checks compatibility, and exposes its frames as an async stream"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+omp-rpc.workspace = true
+async-channel.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+omp-store.workspace = true
