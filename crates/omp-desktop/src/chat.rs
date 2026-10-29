@@ -6,6 +6,7 @@ use std::{path::PathBuf, sync::Arc};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
 use gpui_kit::component::text::TextView;
+use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, Sizable as _};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
@@ -50,6 +51,9 @@ pub struct ChatView {
 	dialog:     Option<Entity<DialogView>>,
 	/// Thinking blocks the user expanded, by (row, block).
 	expanded:   std::collections::HashSet<(usize, usize)>,
+	/// Abort requests sent, for tests that check one key press aborts once.
+	#[cfg(test)]
+	pub(crate) aborts: usize,
 	_tasks:     Vec<Task<()>>,
 	_subs:      Vec<Subscription>,
 }
@@ -82,6 +86,8 @@ impl ChatView {
 			composer,
 			dialog: None,
 			expanded: Default::default(),
+			#[cfg(test)]
+			aborts: 0,
 			_tasks: Vec::new(),
 			_subs: vec![sub],
 		};
@@ -154,6 +160,11 @@ impl ChatView {
 	#[cfg(test)]
 	pub(crate) fn composer_text(&self, cx: &App) -> String {
 		self.composer.read(cx).value().to_string()
+	}
+
+	#[cfg(test)]
+	pub(crate) fn composer(&self) -> Entity<TextareaState> {
+		self.composer.clone()
 	}
 
 	/// Labels of the open `select` dialog, if one is shown.
@@ -293,6 +304,10 @@ impl ChatView {
 		let Some(client) = self.client() else {
 			return;
 		};
+		#[cfg(test)]
+		{
+			self.aborts += 1;
+		}
 		cx.background_spawn(async move {
 			_ = client.call(&AbortCommand {});
 		})
@@ -300,7 +315,8 @@ impl ChatView {
 	}
 
 	/// Esc in an empty composer stops the agent; with text it keeps the
-	/// input's own handling.
+	/// input's own handling. Text an IME is composing is already part of the
+	/// value, so Esc that cancels a composition does not abort.
 	fn on_escape(&mut self, cx: &mut Context<Self>) {
 		if self.model.busy() && self.composer.read(cx).value().is_empty() {
 			self.abort(cx);
@@ -609,7 +625,7 @@ impl ChatView {
 									this.on_escape(cx);
 								}
 							}))
-							.child(Textarea::new(&self.composer).w_full()),
+							.child(div().id("composer").child(Textarea::new(&self.composer).w_full()).test_support()),
 					)
 					.when(busy, |row| {
 						row.child(

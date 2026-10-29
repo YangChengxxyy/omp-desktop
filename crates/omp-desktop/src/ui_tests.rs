@@ -5,8 +5,10 @@
 
 use std::time::{Duration, Instant};
 
-use gpui_kit::test::TestWindowExt as _;
-use gpui_kit::{AppContext as _, Bounds, Point, TestAppContext, WindowBounds, WindowOptions, px, size};
+use gpui_kit::test::{TestInput, TestWindowExt as _};
+use gpui_kit::{
+	AppContext as _, Bounds, ElementInputHandler, Point, TestAppContext, WindowBounds, WindowOptions, px, size,
+};
 use omp_bridge::SessionOptions;
 use omp_store::display::{Block, Role};
 
@@ -182,9 +184,33 @@ async fn busy_enter_queues_chip_removal_and_esc_aborts(cx: &mut TestAppContext) 
 		view.read_with(cx, |v, _| v.queue().follow_up.is_empty() && v.queue().steering.is_empty())
 	});
 
-	// Empty composer + Esc stops the run long before `sleep 60` ends.
+	// Esc that cancels a pinyin composition in an empty composer must not
+	// abort. The composing text is already part of the composer's value when
+	// the capture-phase handler sees Esc, so the non-empty check covers it.
+	let composer = view.read_with(cx, |v, _| v.composer());
+	cx.update_window(handle, |_, window, cx| {
+		window.click("composer", cx);
+		let bounds = window.find("composer").bounds();
+		let mut ime = TestInput::new(ElementInputHandler::new(bounds, composer.clone()), window);
+		ime.compose_text(None, "ni", None, cx);
+		assert!(ime.marked_text_range(cx).is_some(), "composition is marked");
+		window.press("escape", cx);
+	})
+	.unwrap();
+	assert_eq!(view.read_with(cx, |v, _| v.aborts), 0, "Esc during IME composition sent an abort");
+	// Clear whatever the cancelled composition left, so the composer is empty.
+	cx.update_window(handle, |_, window, cx| {
+		composer.update(cx, |state, cx| state.clean(window, cx));
+		window.render_frame(cx);
+	})
+	.unwrap();
+	assert_eq!(view.read_with(cx, |v, cx| v.composer_text(cx)), "");
+
+	// Empty composer + Esc stops the run long before `sleep 60` ends, with
+	// exactly one abort per key press.
 	let stopped = Instant::now();
 	cx.update_window(handle, |_, window, cx| window.press("escape", cx)).unwrap();
+	assert_eq!(view.read_with(cx, |v, _| v.aborts), 1, "one Esc must send one abort");
 	wait_until(cx, Duration::from_secs(30), "abort settles", |cx| view.read_with(cx, |v, _| v.is_idle()));
 	assert!(stopped.elapsed() < Duration::from_secs(30), "abort took {:?}", stopped.elapsed());
 	assert!(view.read_with(cx, |v, _| !v.tool_runs_running("bash")), "bash still marked running");
