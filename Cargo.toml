@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/omp-bridge", "crates/omp-store"]
+members = ["crates/omp-bridge", "crates/omp-store", "crates/omp-desktop"]
 # Vendored upstream crate declares its own [workspace]; keep it out of ours.
 exclude = ["vendor/omp-rpc"]
 

@@ -11,6 +11,8 @@
 //! `message_end` is authoritative in both modes and replaces whatever the
 //! stream produced.
 
+pub mod display;
+
 use std::collections::HashMap;
 
 use omp_rpc::{

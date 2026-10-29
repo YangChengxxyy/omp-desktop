@@ -138,7 +138,7 @@ omp-desktop/
 | 阶段 | 内容 | 验收 |
 | --- | --- | --- |
 | M0 骨架（已完成） | workspace、vendor omp-rpc（tag `v18.13.3`）、`omp-bridge` 拉起进程并转成 async 事件流、`SetEventFilterDelta` 命令、版本与协议检测 | `cargo run -p omp-bridge --example stream` 发一个 prompt，按 `messageId` 用增量重建出回复，结果和 `message_end` 一致。实测：工具调用、thinking、正文 3 种 block 全部一致，0 处不一致 |
-| M1 单会话对话 | GPUI 窗口；消息流（Markdown、代码块、thinking 折叠）；输入框（中文 IME、多行、图片粘贴）；发送 / abort | 和 TUI 并排对照，同一个问题的回答内容一致；中文输入法正常 |
+| M1 单会话对话（基础版已完成） | GPUI 窗口；消息流（Markdown、代码块、thinking 折叠）；输入框（中文 IME、多行、图片粘贴）；发送 / abort | 已完成：消息流、Markdown、thinking 折叠、工具调用卡片与结果、多行输入、发送/abort/排队、对话框（select/confirm/input/editor/ask）、状态栏、断开重连。无头窗口测试连真实 omp 通过（发送→流式回复；always-ask 下审批弹窗→点击批准→文件写入）。未完成：图片粘贴；中文 IME 与真实窗口像素仍需人工确认 |
 | M2 工具与交互 | 工具调用卡片（bash 输出、edit diff、read）；ask/approval/confirm 对话框；队列 chip（steer/follow-up、移除、提升） | 能完成一次需要审批的 edit；`ask` 的多选和自由输入能正确回传 |
 | M3 会话管理 | 侧栏会话列表（按项目分组、搜索）；打开/新建/fork；多 tab 多进程；断线重连 | 在 TUI 里新建的会话会出现在列表中，并能在客户端继续对话 |
 | M4 状态与控制 | 模型/思考档位切换、上下文用量、费用、compact、todo 面板、子 agent 面板（progress 订阅、取消、steer） | `get_state` 的各个字段都能在界面上看到 |
