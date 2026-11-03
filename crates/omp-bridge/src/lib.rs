@@ -11,7 +11,10 @@ use std::{
 	thread,
 };
 
-use omp_rpc::{Client, ClientOptions, Command, Event, SetAskDialogCommand};
+use omp_rpc::{
+	Client, ClientOptions, Command, Event, SetAskDialogCommand, SetSubagentSubscriptionCommand,
+	SubagentSubscriptionLevel,
+};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -148,6 +151,7 @@ impl Session {
 		let filter = client.call(&SetEventFilterDelta { events: None, message_updates: "delta" })?;
 		let delta = filter.get("messageUpdates").and_then(Value::as_str) == Some("delta");
 		client.call(&SetAskDialogCommand { enabled: true })?;
+		client.call(&SetSubagentSubscriptionCommand { level: SubagentSubscriptionLevel::Progress })?;
 
 		let (tx, events) = async_channel::unbounded();
 		thread::Builder::new()

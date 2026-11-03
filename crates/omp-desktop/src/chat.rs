@@ -4,21 +4,28 @@
 use std::{path::PathBuf, sync::Arc};
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
+use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
+use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+use gpui_kit::component::progress::Progress;
+use gpui_kit::component::switch::Switch;
 use gpui_kit::component::text::TextView;
 use gpui_kit::base::TestSupportExt as _;
-use gpui_kit::component::{ActiveTheme as _, Disableable as _, Sizable as _};
+use gpui_kit::component::{ActiveTheme as _, Disableable as _, Selectable as _, Sizable as _};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use omp_bridge::{Session, SessionOptions};
 use omp_rpc::{
-	AbortCommand, AgentMessage, Client, Event, ForkCommand, GetSessionStatsCommand, GetStateCommand,
-	PromoteQueuedMessageCommand, PromptCommand, QueuedMessageQueue, RemoveQueuedMessageCommand, StreamingBehavior,
+	AbortCommand, AgentMessage, CancelSubagentCommand, Client, CompactCommand, Event, ForkCommand,
+	GetAvailableModelsCommand, GetAvailableThinkingLevelsCommand, GetSessionStatsCommand, GetStateCommand,
+	GetSubagentsCommand, ModelInfo, PromoteQueuedMessageCommand, PromptCommand, QueuedMessageQueue,
+	RemoveQueuedMessageCommand, SessionStats, SetAutoCompactionCommand, SetModelCommand, SetThinkingLevelCommand,
+	SteerSubagentCommand, StreamingBehavior, SubagentStatus, ThinkingLevel,
 };
 use omp_store::display::{Block, Role, View};
 
 use crate::dialog::{self, DialogEvent, DialogView};
-use crate::session::{Activity, Notice, SessionModel};
+use crate::session::{Activity, Notice, PendingControl, SessionModel};
+use crate::status;
 use crate::theme;
 use crate::tool_card::{ToolCard, clip_lines, truncate};
 
@@ -71,7 +78,15 @@ pub struct ChatView {
 	/// after the first message.
 	session_file: Option<PathBuf>,
 	model:        SessionModel,
-	cost:         Option<f64>,
+	stats:        Option<SessionStats>,
+	/// Choices for the status-bar menus, fetched once per connection.
+	models:       Vec<ModelInfo>,
+	thinking_levels: Vec<ThinkingLevel>,
+	/// The right-hand panel (context, cost, todos, subagents, every
+	/// `get_state` field) is open.
+	panel:        bool,
+	/// Steer input per subagent id, created when its 干预 button is pressed.
+	steer_inputs: std::collections::HashMap<String, (Entity<InputState>, Subscription)>,
 	list:         ListState,
 	composer:     Entity<TextareaState>,
 	dialog:       Option<Entity<DialogView>>,
@@ -119,7 +134,11 @@ impl ChatView {
 			fork,
 			connection: Connection::Connecting,
 			model: SessionModel::default(),
-			cost: None,
+			stats: None,
+			models: Vec::new(),
+			thinking_levels: Vec::new(),
+			panel: false,
+			steer_inputs: Default::default(),
 			list,
 			composer,
 			dialog: None,
@@ -174,6 +193,7 @@ impl ChatView {
 				this.model.notices.extend(notice);
 				this.connection = Connection::Connected(client);
 				this.refresh_state(cx);
+				this.load_choices(cx);
 				cx.notify();
 			});
 			while let Ok(event) = events.recv().await {
@@ -317,6 +337,41 @@ impl ChatView {
 	}
 
 	#[cfg(test)]
+	pub(crate) fn state(&self) -> Option<&omp_rpc::SessionState> {
+		self.model.state.as_ref()
+	}
+
+	#[cfg(test)]
+	pub(crate) fn subagents(&self) -> &[crate::session::SubagentRow] {
+		&self.model.subagents
+	}
+
+	#[cfg(test)]
+	pub(crate) fn choices(&self) -> (usize, usize) {
+		(self.models.len(), self.thinking_levels.len())
+	}
+
+	#[cfg(test)]
+	pub(crate) fn thinking_levels_for_test(&self) -> Vec<ThinkingLevel> {
+		self.thinking_levels.clone()
+	}
+
+	#[cfg(test)]
+	pub(crate) fn models_for_test(&self) -> Vec<(String, String)> {
+		self.models.iter().map(|m| (m.provider.clone(), m.id.clone())).collect()
+	}
+
+	#[cfg(test)]
+	pub(crate) fn has_stats(&self) -> bool {
+		self.stats.is_some()
+	}
+
+	#[cfg(test)]
+	pub(crate) fn control_pending(&self) -> bool {
+		self.model.pending.is_some()
+	}
+
+	#[cfg(test)]
 	pub(crate) fn tool_runs(&self) -> &omp_store::tools::ToolRuns {
 		&self.model.tools
 	}
@@ -357,7 +412,7 @@ impl ChatView {
 					this.model.state = Some(state);
 				}
 				if let Some(stats) = stats {
-					this.cost = Some(stats.cost);
+					this.stats = Some(stats);
 				}
 				cx.notify();
 			});
@@ -461,6 +516,164 @@ impl ChatView {
 		}
 	}
 
+	/// Model and thinking-level choices plus the subagent snapshot, which
+	/// covers runs that started before this client subscribed (resume,
+	/// reconnect).
+	fn load_choices(&mut self, cx: &mut Context<Self>) {
+		let Some(client) = self.client() else {
+			return;
+		};
+		let fetch = cx.background_spawn(async move {
+			(
+				client.call(&GetAvailableModelsCommand {}).ok(),
+				client.call(&GetAvailableThinkingLevelsCommand {}).ok(),
+				client.call(&GetSubagentsCommand {}).ok(),
+			)
+		});
+		cx.spawn(async move |this, cx| {
+			let (models, levels, subagents) = fetch.await;
+			_ = this.update(cx, |this, cx| {
+				this.models = models.unwrap_or_default();
+				this.thinking_levels = levels.unwrap_or_default();
+				if let Some(subagents) = subagents {
+					this.model.load_subagents(subagents);
+				}
+				cx.notify();
+			});
+		})
+		.detach();
+	}
+
+	/// Runs a control command off the UI thread with its controls disabled,
+	/// then refetches the state; `label` names it in the error notice.
+	fn control<T: Send + 'static>(
+		&mut self,
+		pending: PendingControl,
+		label: &'static str,
+		call: impl FnOnce(&Client) -> Result<T, omp_rpc::Error> + Send + 'static,
+		cx: &mut Context<Self>,
+	) {
+		let Some(client) = self.client() else {
+			return;
+		};
+		if self.model.pending.is_some() {
+			return;
+		}
+		self.model.pending = Some(pending);
+		cx.notify();
+		let call = cx.background_spawn(async move { call(&client).map(|_| ()) });
+		cx.spawn(async move |this, cx| {
+			let result = call.await;
+			_ = this.update(cx, |this, cx| {
+				this.model.pending = None;
+				match result {
+					// `manual_compaction_end` already said why nothing was compacted.
+					Err(omp_rpc::Error::Command { .. }) if pending == PendingControl::Compact => {},
+					Err(error) => this.model.notices.push(Notice::Error(format!("{label}失败：{error}"))),
+					Ok(()) => {},
+				}
+				this.refresh_state(cx);
+				cx.notify();
+			});
+		})
+		.detach();
+	}
+
+	fn set_model(&mut self, provider: String, model_id: String, cx: &mut Context<Self>) {
+		self.control(PendingControl::Model, "切换模型", move |c| c.call(&SetModelCommand { provider, model_id }), cx);
+	}
+
+	fn set_thinking(&mut self, level: ThinkingLevel, cx: &mut Context<Self>) {
+		self.control(PendingControl::Thinking, "切换思考档位", move |c| c.call(&SetThinkingLevelCommand { level }), cx);
+	}
+
+	fn compact(&mut self, cx: &mut Context<Self>) {
+		self.control(
+			PendingControl::Compact,
+			"压缩",
+			|c| c.call(&CompactCommand { custom_instructions: None }),
+			cx,
+		);
+	}
+
+	fn set_auto_compaction(&mut self, enabled: bool, cx: &mut Context<Self>) {
+		self.control(
+			PendingControl::AutoCompact,
+			"自动压缩",
+			move |c| c.call(&SetAutoCompactionCommand { enabled }),
+			cx,
+		);
+	}
+
+	fn cancel_subagent(&mut self, subagent_id: String, cx: &mut Context<Self>) {
+		let Some(client) = self.client() else {
+			return;
+		};
+		let call = cx.background_spawn(async move { client.call(&CancelSubagentCommand { subagent_id }) });
+		cx.spawn(async move |this, cx| {
+			let notice = match call.await {
+				// The row updates through `subagent_lifecycle`.
+				Ok(true) => return,
+				Ok(false) => Notice::Info("子 agent 已经结束".into()),
+				Err(error) => Notice::Error(format!("取消子 agent 失败：{error}")),
+			};
+			_ = this.update(cx, |this, cx| {
+				this.model.notices.push(notice);
+				cx.notify();
+			});
+		})
+		.detach();
+	}
+
+	/// Opens the steer input for a subagent, or sends its text when open.
+	fn steer_subagent(&mut self, subagent_id: String, window: &mut Window, cx: &mut Context<Self>) {
+		let Some(input) = self.steer_inputs.get(&subagent_id).map(|(input, _)| input.clone()) else {
+			let input = cx.new(|cx| InputState::new(window, cx).placeholder("给子 agent 的指令，Enter 发送"));
+			let id = subagent_id.clone();
+			let sub = cx.subscribe_in(&input, window, move |this, _, event, window, cx| {
+				if let InputEvent::PressEnter { .. } = event {
+					this.steer_subagent(id.clone(), window, cx);
+				}
+			});
+			input.update(cx, |state, cx| state.focus(window, cx));
+			self.steer_inputs.insert(subagent_id, (input, sub));
+			cx.notify();
+			return;
+		};
+		let message = input.read(cx).value().trim().to_owned();
+		if message.is_empty() {
+			return;
+		}
+		let Some(client) = self.client() else {
+			return;
+		};
+		self.steer_inputs.remove(&subagent_id);
+		cx.notify();
+		let call = cx.background_spawn(async move { client.call(&SteerSubagentCommand { subagent_id, message }) });
+		cx.spawn(async move |this, cx| {
+			if let Err(error) = call.await {
+				_ = this.update(cx, |this, cx| {
+					this.model.notices.push(Notice::Error(format!("干预子 agent 失败：{error}")));
+					cx.notify();
+				});
+			}
+		})
+		.detach();
+	}
+
+	fn open_panel(&mut self, cx: &mut Context<Self>) {
+		if !self.panel {
+			self.toggle_panel(cx);
+		}
+	}
+
+	pub fn toggle_panel(&mut self, cx: &mut Context<Self>) {
+		self.panel = !self.panel;
+		if self.panel {
+			self.refresh_state(cx);
+		}
+		cx.notify();
+	}
 	fn queue_action(&mut self, action: QueueAction, cx: &mut Context<Self>) {
 		let Some(client) = self.client() else {
 			return;
@@ -657,19 +870,99 @@ impl ChatView {
 			(Connection::Connected(_), Activity::Settling) => (p.primary, "收尾中".to_owned()),
 		};
 		let state = self.model.state.as_ref();
-		let model = state.and_then(|s| s.model.as_ref()).map(|m| m.id.clone()).unwrap_or_default();
-		let thinking = state.and_then(|s| s.thinking_level).map(|t| format!("思考 {}", t.as_str())).unwrap_or_default();
-		let context = state
-			.and_then(|s| s.context_usage.as_ref())
-			.map(|u| format!("上下文 {:.0}%", u.percent))
-			.unwrap_or_default();
-		let cost = self.cost.map(|c| format!("${c:.3}")).unwrap_or_default();
+		let connected = matches!(self.connection, Connection::Connected(_));
+		let pending = self.model.pending;
+		let this = cx.entity().downgrade();
+
+		let current = state.and_then(|s| s.model.as_ref()).map(|m| (m.provider.clone(), m.id.clone()));
+		let models = self.models.clone();
+		let model_menu = {
+			let this = this.clone();
+			let current = current.clone();
+			Button::new("status-model")
+				.ghost()
+				.xsmall()
+				.label(current.as_ref().map_or_else(|| "模型".to_owned(), |(_, id)| format!("{id} ▾")))
+				.tooltip("切换模型（仅本会话）")
+				.loading(pending == Some(PendingControl::Model))
+				.disabled(!connected || pending.is_some() || models.is_empty())
+				.dropdown_menu_with_anchor(Anchor::BottomRight, move |menu, _, _| {
+					let mut menu = menu.scrollable(true).max_h(px(420.));
+					for model in &models {
+						let key = (model.provider.clone(), model.id.clone());
+						let this = this.clone();
+						let checked = current.as_ref() == Some(&key);
+						menu = menu.item(PopupMenuItem::new(model.id.clone()).checked(checked).on_click(move |_, _, cx| {
+							let (provider, id) = key.clone();
+							_ = this.update(cx, |view, cx| view.set_model(provider, id, cx));
+						}));
+					}
+					menu
+				})
+		};
+
+		let level = state.and_then(|s| s.thinking_level);
+		let levels = self.thinking_levels.clone();
+		let thinking_menu = {
+			let this = this.clone();
+			Button::new("status-thinking")
+				.ghost()
+				.xsmall()
+				.label(format!("思考 {} ▾", level.map_or("—", |l| l.as_str())))
+				.tooltip("切换思考档位（仅本会话）")
+				.loading(pending == Some(PendingControl::Thinking))
+				.disabled(!connected || pending.is_some() || levels.is_empty())
+				.dropdown_menu_with_anchor(Anchor::BottomRight, move |mut menu, _, _| {
+					for &option in &levels {
+						let this = this.clone();
+						menu = menu.item(PopupMenuItem::new(option.as_str()).checked(level == Some(option)).on_click(
+							move |_, _, cx| {
+								_ = this.update(cx, |view, cx| view.set_thinking(option, cx));
+							},
+						));
+					}
+					menu
+				})
+		};
+
+		let usage = state.and_then(|s| s.context_usage.as_ref());
+		let context_color = |percent: f64| match percent {
+			p_ if p_ >= status::CONTEXT_DANGER => p.danger,
+			p_ if p_ >= status::CONTEXT_WARN => p.warning,
+			_ => p.primary,
+		};
+		let context = usage.map(|u| {
+			div()
+				.flex()
+				.items_center()
+				.gap_1()
+				.child(Progress::new("status-context-bar").w(px(48.)).value(u.percent as f32).color(rgb(context_color(u.percent))))
+				.child(
+					div().text_color(rgb(if u.percent >= status::CONTEXT_WARN { context_color(u.percent) } else { p.muted_foreground })).child(
+						format!("{:.0}% ({} / {})", u.percent, status::tokens(u.tokens), status::tokens(u.context_window)),
+					),
+				)
+		});
+		let compacting = self.model.compacting || state.is_some_and(|s| s.is_compacting);
+		let compact = Button::new("status-compact")
+			.ghost()
+			.xsmall()
+			.label(if compacting { "压缩中…" } else { "压缩" })
+			.tooltip("压缩上下文（compact）")
+			.loading(compacting || pending == Some(PendingControl::Compact))
+			.disabled(!connected || pending.is_some() || compacting || self.model.busy())
+			.on_click(cx.listener(|this, _, _, cx| this.compact(cx)));
+
+		let cost = self.stats.as_ref().map(|s| format!("${:.3}", s.cost));
+		let (done, total) = state.map_or((0, 0), |s| status::todo_counts(&s.todo_phases));
+		let running = self.model.running_subagents();
+		let subagents = self.model.subagents.len();
 		div()
 			.h(px(26.))
 			.flex_none()
 			.flex()
 			.items_center()
-			.gap_4()
+			.gap_3()
 			.px_3()
 			.border_t_1()
 			.border_color(rgb(p.border))
@@ -677,13 +970,246 @@ impl ChatView {
 			.text_xs()
 			.text_color(rgb(p.muted_foreground))
 			.child(div().flex().items_center().gap_1().child(div().size(px(7.)).rounded_full().bg(rgb(dot))).child(label))
-			.child(self.cwd.display().to_string())
+			.child(div().min_w_0().truncate().child(self.cwd.display().to_string()))
 			.child(div().flex_1())
 			.when_some(self.model.status.clone(), |row, status| row.child(status))
-			.child(model)
-			.child(thinking)
+			.child(model_menu)
+			.child(thinking_menu)
+			.children(context)
+			.child(compact)
+			.children(cost)
+			.when(total > 0, |row| {
+				row.child(
+					Button::new("status-todo")
+						.ghost()
+						.xsmall()
+						.label(format!("☑ Todo {done}/{total}"))
+						.on_click(cx.listener(|this, _, _, cx| this.open_panel(cx))),
+				)
+			})
+			.when(subagents > 0, |row| {
+				row.child(
+					Button::new("status-subagents")
+						.ghost()
+						.xsmall()
+						.label(if running > 0 { format!("⑂ 子 agent {running} 运行中") } else { format!("⑂ 子 agent {subagents}") })
+						.on_click(cx.listener(|this, _, _, cx| this.open_panel(cx))),
+				)
+			})
+			.child(
+				Button::new("status-panel")
+					.ghost()
+					.xsmall()
+					.selected(self.panel)
+					.label("详情")
+					.tooltip("上下文、费用、Todo、子 agent 与会话状态（⌘J）")
+					.on_click(cx.listener(|this, _, _, cx| this.toggle_panel(cx))),
+			)
+	}
+
+	fn render_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
+		let p = theme::palette(cx);
+		let state = self.model.state.as_ref();
+		let connected = matches!(self.connection, Connection::Connected(_));
+		let pending = self.model.pending;
+		let heading = |text: &'static str| {
+			div().mt_3().mb_1().text_xs().font_weight(FontWeight::SEMIBOLD).text_color(rgb(p.muted_foreground)).child(text)
+		};
+		let kv = |key: String, value: String| {
+			div()
+				.flex()
+				.gap_2()
+				.text_xs()
+				.child(div().w(px(92.)).flex_none().text_color(rgb(p.muted_foreground)).child(key))
+				.child(div().flex_1().min_w_0().font_family("Menlo").child(value))
+		};
+
+		// Context and compaction.
+		let usage = state.and_then(|s| s.context_usage.as_ref());
+		let auto = state.is_some_and(|s| s.auto_compaction_enabled);
+		let context = div()
+			.flex()
+			.flex_col()
+			.gap_1()
+			.child(heading("上下文"))
+			.child(
+				Progress::new("panel-context-bar").value(usage.map_or(0., |u| u.percent as f32)).color(rgb(match usage {
+					Some(u) if u.percent >= status::CONTEXT_DANGER => p.danger,
+					Some(u) if u.percent >= status::CONTEXT_WARN => p.warning,
+					_ => p.primary,
+				})),
+			)
+			.child(kv(
+				"已用".into(),
+				usage.map_or("—".into(), |u| {
+					format!("{} / {}（{:.1}%）", status::tokens(u.tokens), status::tokens(u.context_window), u.percent)
+				}),
+			))
+			.child(
+				div().flex().items_center().justify_between().child(
+					Switch::new("panel-auto-compact")
+						.xsmall()
+						.label("自动压缩")
+						.checked(auto)
+						.disabled(!connected || pending.is_some())
+						.on_click(cx.listener(|this, checked: &bool, _, cx| this.set_auto_compaction(*checked, cx))),
+				),
+			);
+
+		// Cost.
+		let cost = div().flex().flex_col().gap_1().child(heading("费用")).children(self.stats.as_ref().map(|s| {
+			div()
+				.flex()
+				.flex_col()
+				.gap_1()
+				.child(kv("累计".into(), format!("${:.4}", s.cost)))
+				.child(kv("输入".into(), status::tokens(s.tokens.input)))
+				.child(kv("输出".into(), status::tokens(s.tokens.output)))
+				.child(kv("缓存读/写".into(), format!("{} / {}", status::tokens(s.tokens.cache_read), status::tokens(s.tokens.cache_write))))
+				.child(kv("消息 / 工具".into(), format!("{} / {}", s.total_messages, s.tool_calls)))
+		}));
+
+		// Todos.
+		let phases = state.map(|s| s.todo_phases.as_slice()).unwrap_or_default();
+		let todo = div().flex().flex_col().gap_0p5().child(heading("Todo")).when(phases.is_empty(), |col| {
+			col.child(div().text_xs().text_color(rgb(p.muted_foreground)).child("暂无"))
+		});
+		let todo = phases.iter().enumerate().fold(todo, |col, (pi, phase)| {
+			let header = div().id(("todo-phase", pi)).text_xs().font_weight(FontWeight::MEDIUM).child(phase.name.clone());
+			phase.tasks.iter().fold(col.child(header), |col, task| {
+				let done = matches!(task.status, omp_rpc::TodoStatus::Completed | omp_rpc::TodoStatus::Abandoned);
+				col.child(
+					div()
+						.flex()
+						.gap_1()
+						.pl_2()
+						.text_xs()
+						.when(done, |row| row.text_color(rgb(p.muted_foreground)))
+						.child(div().flex_none().child(status::todo_mark(task.status)))
+						.child(div().min_w_0().child(task.content.clone()))
+						.when_some(task.blocker.clone(), |row, blocker| {
+							row.child(div().text_color(rgb(p.warning)).child(format!("（{blocker}）")))
+						}),
+				)
+			})
+		});
+
+		// Subagents.
+		let subagents = div().flex().flex_col().gap_2().child(heading("子 agent")).when(self.model.subagents.is_empty(), |col| {
+			col.child(div().text_xs().text_color(rgb(p.muted_foreground)).child("暂无"))
+		});
+		let subagents = self.model.subagents.iter().enumerate().fold(subagents, |col, (row, agent)| {
+			let color = match agent.status {
+				SubagentStatus::Pending | SubagentStatus::Running => p.primary,
+				SubagentStatus::Completed => p.success,
+				SubagentStatus::Failed => p.danger,
+				SubagentStatus::Aborted => p.warning,
+			};
+			let progress = agent.progress.as_ref();
+			let field = |key: &str| progress.and_then(|p| p.get(key));
+			let activity = field("currentTool")
+				.and_then(|v| v.as_str())
+				.map(|tool| format!("正在运行 {tool}"))
+				.or_else(|| field("lastIntent").and_then(|v| v.as_str()).map(str::to_owned));
+			let mut metrics = Vec::new();
+			if let Some(n) = field("toolCount").and_then(|v| v.as_i64()) {
+				metrics.push(format!("{n} 次工具"));
+			}
+			if let Some(n) = field("tokens").and_then(|v| v.as_i64()).filter(|n| *n > 0) {
+				metrics.push(format!("{} tok", status::tokens(n)));
+			}
+			if let Some(ms) = field("durationMs").and_then(|v| v.as_f64()).filter(|ms| *ms > 0.) {
+				metrics.push(format!("{:.0}s", ms / 1000.));
+			}
+			if let Some(cost) = field("cost").and_then(|v| v.as_f64()).filter(|c| *c > 0.) {
+				metrics.push(format!("${cost:.3}"));
+			}
+			let steer = agent.id.as_ref().and_then(|id| self.steer_inputs.get(id)).map(|(input, _)| input.clone());
+			let card = div()
+				.id(("subagent", row))
+				.flex()
+				.flex_col()
+				.gap_1()
+				.p_2()
+				.rounded(px(6.))
+				.border_1()
+				.border_color(rgb(p.border))
+				.bg(rgb(p.elevated))
+				.text_xs()
+				.child(
+					div()
+						.flex()
+						.items_center()
+						.gap_1()
+						.child(div().size(px(7.)).rounded_full().bg(rgb(color)))
+						.child(div().font_weight(FontWeight::SEMIBOLD).child(agent.agent.clone()))
+						.child(div().text_color(rgb(p.muted_foreground)).child(agent.status.as_str())),
+				)
+				.when_some(agent.task.clone(), |card, task| card.child(div().child(truncate(&task, 120))))
+				.when_some(activity, |card, text| {
+					card.child(div().text_color(rgb(p.muted_foreground)).font_family("Menlo").child(truncate(&text, 80)))
+				})
+				.when(!metrics.is_empty(), |card| {
+					card.child(div().text_color(rgb(p.muted_foreground)).child(metrics.join(" · ")))
+				})
+				.when_some(steer, |card, input| {
+					card.child(div().id(("subagent-steer-input", row)).child(Input::new(&input).small()).test_support())
+				});
+			let card = match (&agent.id, agent.running()) {
+				(Some(id), true) => {
+					let (steer_id, cancel_id) = (id.clone(), id.clone());
+					card.child(
+						div()
+							.flex()
+							.gap_1()
+							.child(
+								Button::new(("subagent-steer", row))
+									.xsmall()
+									.label("干预")
+									.tooltip("给子 agent 发一条指令")
+									.disabled(!connected)
+									.on_click(cx.listener(move |this, _, window, cx| {
+										this.steer_subagent(steer_id.clone(), window, cx)
+									})),
+							)
+							.child(
+								Button::new(("subagent-cancel", row))
+									.xsmall()
+									.danger()
+									.label("取消")
+									.disabled(!connected)
+									.on_click(cx.listener(move |this, _, _, cx| this.cancel_subagent(cancel_id.clone(), cx))),
+							),
+					)
+				},
+				_ => card,
+			};
+			col.child(card)
+		});
+
+		// Every `get_state` field.
+		let fields = div().flex().flex_col().gap_0p5().child(heading("会话状态")).children(
+			state.map(status::state_rows).unwrap_or_default().into_iter().map(|(key, label, value)| {
+				div().id(SharedString::from(format!("state-{key}"))).child(kv(label.into(), value)).test_support()
+			}),
+		);
+
+		div()
+			.id("detail-panel")
+			.w(px(300.))
+			.flex_none()
+			.h_full()
+			.overflow_y_scroll()
+			.border_l_1()
+			.border_color(rgb(p.border))
+			.bg(rgb(p.panel))
+			.px_3()
+			.pb_4()
 			.child(context)
 			.child(cost)
+			.child(todo)
+			.child(subagents)
+			.child(fields)
 	}
 
 	fn render_composer(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -915,8 +1441,14 @@ impl Render for ChatView {
 						),
 				)
 			})
-			.child(body)
-			.child(self.render_composer(cx))
+			.child(
+				div()
+					.flex_1()
+					.min_h_0()
+					.flex()
+					.child(div().flex_1().min_w_0().flex().flex_col().child(body).child(self.render_composer(cx)))
+					.when(self.panel, |row| row.child(self.render_panel(cx))),
+			)
 			.child(self.render_status(cx))
 			.child(self.render_notices(cx))
 			.when_some(self.dialog.clone(), |root, dialog| {

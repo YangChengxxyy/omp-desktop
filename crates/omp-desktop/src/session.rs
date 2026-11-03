@@ -2,7 +2,8 @@
 //! free of GPUI so it can be tested directly.
 
 use omp_rpc::{
-	ExtensionUiRequest, PromptStatus, RpcAgentEvent, RpcNotification, SessionState,
+	ExtensionUiRequest, PromptStatus, RpcAgentEvent, RpcNotification, SessionState, SubagentLifecycleStatus,
+	SubagentStatus,
 };
 use omp_store::Transcript;
 
@@ -36,10 +37,48 @@ pub struct SessionModel {
 	pub notices:    Vec<Notice>,
 	pub status:     Option<String>,
 	pub queue:      Queue,
+	/// Subagents in launch order; rows stay after the run ends so the panel
+	/// can show the final state.
+	pub subagents:  Vec<SubagentRow>,
+	/// Control request in flight, if any: the controls stay disabled until
+	/// the matching notification arrives (`set_model` → `model_changed`, …).
+	pub pending:    Option<PendingControl>,
+	/// A compaction (manual or automatic) is running.
+	pub compacting: bool,
 	/// Every queue state seen, for tests: a steer is delivered within moments,
 	/// so the current queue alone cannot show that it was queued.
 	#[cfg(test)]
 	pub queue_log:  Vec<Queue>,
+}
+
+/// One subagent run in the panel. Lifecycle and progress frames share
+/// `index`; only lifecycle carries the `id` that `cancel_subagent` takes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SubagentRow {
+	pub index:  i64,
+	pub id:     Option<String>,
+	pub agent:  String,
+	pub status: SubagentStatus,
+	/// Latest task text (`description` at start, then the progress `task`).
+	pub task:   Option<String>,
+	/// Raw `AgentProgress` record from the latest `subagent_progress`.
+	pub progress: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+impl SubagentRow {
+	pub fn running(&self) -> bool {
+		matches!(self.status, SubagentStatus::Pending | SubagentStatus::Running)
+	}
+}
+
+/// A control command in flight; its controls stay disabled until the call
+/// returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingControl {
+	Model,
+	Thinking,
+	Compact,
+	AutoCompact,
 }
 
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -104,6 +143,14 @@ impl SessionModel {
 			RpcNotification::RpcFrameError(_) => {
 				self.notices.push(Notice::Error("an event exceeded the RPC transport limit and was dropped".into()));
 			},
+			RpcNotification::SubagentLifecycle(event) => self.apply_subagent_lifecycle(event.payload),
+			RpcNotification::SubagentProgress(event) => self.apply_subagent_progress(event.payload),
+			RpcNotification::SessionInfoUpdate(update) => {
+				if let Some(state) = &mut self.state {
+					state.session_name = update.title;
+				}
+			},
+			RpcNotification::ConfigUpdate(_) => effects.refresh_state = true,
 			_ => {},
 		}
 		effects
@@ -112,7 +159,35 @@ impl SessionModel {
 	fn apply_event(&mut self, event: RpcAgentEvent, effects: &mut Effects) {
 		match &event {
 			RpcAgentEvent::AgentStart(_) => self.activity.0 = Activity::Running,
-			RpcAgentEvent::ModelChanged(_) | RpcAgentEvent::TurnEnd(_) => effects.refresh_state = true,
+			RpcAgentEvent::ModelChanged(_) | RpcAgentEvent::TurnEnd(_) | RpcAgentEvent::AgentEnd(_) => {
+				effects.refresh_state = true;
+			},
+			RpcAgentEvent::ThinkingLevelChanged(event) => {
+				if let Some(state) = &mut self.state {
+					state.thinking_level = event.thinking_level;
+				}
+			},
+			RpcAgentEvent::AutoCompactionStart(_) | RpcAgentEvent::ManualCompactionStart(_) => {
+				self.compacting = true;
+			},
+			RpcAgentEvent::AutoCompactionEnd(_) => {
+				self.compacting = false;
+				effects.refresh_state = true;
+			},
+			RpcAgentEvent::ManualCompactionEnd(end) => {
+				self.compacting = false;
+				effects.refresh_state = true;
+				if let Some(error) = &end.error_message
+					&& !end.aborted
+				{
+					self.notices.push(Notice::Info(format!("压缩未执行：{error}")));
+				}
+			},
+			RpcAgentEvent::TodoAutoClear(_) => {
+				if let Some(state) = &mut self.state {
+					state.todo_phases.clear();
+				}
+			},
 			RpcAgentEvent::QueueUpdate(update) => {
 				self.queue = Queue { steering: update.steering.clone(), follow_up: update.follow_up.clone() };
 				#[cfg(test)]
@@ -139,6 +214,69 @@ impl SessionModel {
 			let first = effects.rows.map_or(index, |(row, _)| row.min(index));
 			effects.rows = Some((first.min(rows), self.transcript.entries().len()));
 		}
+	}
+
+	fn subagent_row(&mut self, index: i64, agent: &str) -> &mut SubagentRow {
+		let position = match self.subagents.iter().position(|row| row.index == index) {
+			Some(position) => position,
+			None => {
+				self.subagents.push(SubagentRow {
+					index,
+					id: None,
+					agent: agent.to_owned(),
+					status: SubagentStatus::Pending,
+					task: None,
+					progress: None,
+				});
+				self.subagents.len() - 1
+			},
+		};
+		&mut self.subagents[position]
+	}
+
+	fn apply_subagent_lifecycle(&mut self, payload: omp_rpc::SubagentLifecyclePayload) {
+		let row = self.subagent_row(payload.index, &payload.agent);
+		row.id = Some(payload.id);
+		row.status = match payload.status {
+			SubagentLifecycleStatus::Started => SubagentStatus::Running,
+			SubagentLifecycleStatus::Completed => SubagentStatus::Completed,
+			SubagentLifecycleStatus::Failed => SubagentStatus::Failed,
+			SubagentLifecycleStatus::Aborted => SubagentStatus::Aborted,
+		};
+		if row.task.is_none() {
+			row.task = payload.description;
+		}
+	}
+
+	fn apply_subagent_progress(&mut self, payload: omp_rpc::SubagentProgressPayload) {
+		let row = self.subagent_row(payload.index, &payload.agent);
+		// Progress can trail the `completed` lifecycle frame; keep the end state.
+		if row.status == SubagentStatus::Pending {
+			row.status = SubagentStatus::Running;
+		}
+		row.task = Some(payload.task);
+		row.progress = Some(payload.progress);
+	}
+
+	/// Replaces the subagent rows with a `get_subagents` snapshot (on connect
+	/// or reconnect, when lifecycle frames may have been missed).
+	pub fn load_subagents(&mut self, snapshots: Vec<omp_rpc::SubagentSnapshot>) {
+		self.subagents = snapshots
+			.into_iter()
+			.map(|s| SubagentRow {
+				index:    s.index,
+				id:       Some(s.id),
+				agent:    s.agent,
+				status:   s.status,
+				task:     s.task.or(s.description),
+				progress: s.progress,
+			})
+			.collect();
+		self.subagents.sort_by_key(|row| row.index);
+	}
+
+	pub fn running_subagents(&self) -> usize {
+		self.subagents.iter().filter(|row| row.running()).count()
 	}
 
 	fn apply_ui(&mut self, request: ExtensionUiRequest) {
@@ -308,5 +446,52 @@ mod tests {
 		m.load_history(messages[..1].to_vec());
 		assert_eq!(m.row_count(), 1);
 		assert!(m.tools.get("c1").is_none());
+	}
+
+	#[test]
+	fn subagent_frames_merge_by_index() {
+		let mut m = SessionModel::default();
+		notify(&mut m, json!({"type":"subagent_progress","payload":{"index":0,"agent":"explore","agentSource":"bundled",
+			"task":"scan repo","progress":{"toolCount":2}}}));
+		assert_eq!(m.subagents.len(), 1);
+		assert_eq!(m.subagents[0].status, SubagentStatus::Running);
+		assert_eq!(m.subagents[0].id, None, "progress frames carry no id");
+		notify(&mut m, json!({"type":"subagent_lifecycle","payload":{"id":"sa-1","agent":"explore","agentSource":"bundled",
+			"status":"started","index":0,"description":"desc"}}));
+		notify(&mut m, json!({"type":"subagent_lifecycle","payload":{"id":"sa-2","agent":"task","agentSource":"bundled",
+			"status":"started","index":1}}));
+		assert_eq!(m.subagents.len(), 2);
+		assert_eq!(m.subagents[0].id.as_deref(), Some("sa-1"));
+		assert_eq!(m.subagents[0].task.as_deref(), Some("scan repo"), "progress task wins over description");
+		assert_eq!(m.running_subagents(), 2);
+		notify(&mut m, json!({"type":"subagent_lifecycle","payload":{"id":"sa-1","agent":"explore","agentSource":"bundled",
+			"status":"aborted","index":0}}));
+		// A late progress frame must not resurrect a finished run.
+		notify(&mut m, json!({"type":"subagent_progress","payload":{"index":0,"agent":"explore","agentSource":"bundled",
+			"task":"scan repo","progress":{}}}));
+		assert_eq!(m.subagents[0].status, SubagentStatus::Aborted);
+		assert_eq!(m.running_subagents(), 1);
+	}
+
+	#[test]
+	fn compaction_and_state_events() {
+		let mut m = SessionModel::default();
+		m.state = Some(serde_json::from_value(json!({"sessionId":"s","thinkingLevel":"high",
+			"todoPhases":[{"name":"p","tasks":[{"content":"a","status":"pending"}]}]})).unwrap());
+		notify(&mut m, json!({"type":"manual_compaction_start"}));
+		assert!(m.compacting);
+		let effects = notify(&mut m, json!({"type":"manual_compaction_end","aborted":false,"skipped":true,
+			"errorMessage":"nothing to compact"}));
+		assert!(!m.compacting);
+		assert!(effects.refresh_state);
+		assert_eq!(m.notices, [Notice::Info("压缩未执行：nothing to compact".into())]);
+
+		notify(&mut m, json!({"type":"thinking_level_changed","thinkingLevel":"low"}));
+		assert_eq!(m.state.as_ref().unwrap().thinking_level, Some(omp_rpc::ThinkingLevel::Low));
+		notify(&mut m, json!({"type":"session_info_update","sessionId":"s","title":"新标题"}));
+		assert_eq!(m.state.as_ref().unwrap().session_name.as_deref(), Some("新标题"));
+		notify(&mut m, json!({"type":"todo_auto_clear"}));
+		assert!(m.state.as_ref().unwrap().todo_phases.is_empty());
+		assert!(notify(&mut m, json!({"type":"model_changed"})).refresh_state);
 	}
 }

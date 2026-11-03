@@ -5,6 +5,7 @@
 mod chat;
 mod dialog;
 mod session;
+mod status;
 mod theme;
 mod tool_card;
 mod workspace;

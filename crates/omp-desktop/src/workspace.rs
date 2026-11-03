@@ -207,6 +207,12 @@ impl Workspace {
 				self.sidebar = !self.sidebar;
 				cx.notify();
 			},
+			"j" => {
+				let Some(tab) = self.tabs.get(self.active) else {
+					return;
+				};
+				tab.view.update(cx, |view, cx| view.toggle_panel(cx));
+			},
 			key => match key.parse::<usize>() {
 				Ok(n @ 1..=9) => self.activate(n - 1, window, cx),
 				_ => return,

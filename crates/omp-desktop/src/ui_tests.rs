@@ -597,3 +597,136 @@ impl ChatView {
 		self.tool_runs().iter().filter(|(_, run)| run.name == "edit").find_map(|(_, run)| run.diff())
 	}
 }
+
+/// M4 acceptance without a model call: every `get_state` field shows in the
+/// detail panel, and the status-bar menus, auto-compact switch and compact
+/// button drive the session. Model and thinking changes are session-only.
+#[gpui_kit::test]
+#[ignore = "spawns omp"]
+async fn status_bar_controls_and_detail_panel(cx: &mut TestAppContext) {
+	let (handle, view, dir) = open_chat(cx, "status", &["--no-tools"]);
+	wait_until(cx, Duration::from_secs(30), "state, stats and choices load", |cx| {
+		view.read_with(cx, |v, _| v.state().is_some() && v.has_stats() && v.choices().0 > 1 && v.choices().1 > 1)
+	});
+
+	// The panel lists every field `get_state` sent, plus the optional ones.
+	cx.update_window(handle, |_, window, cx| {
+		window.render_frame(cx);
+		window.click("status-panel", cx);
+		window.render_frame(cx);
+	})
+	.unwrap();
+	let state = view.read_with(cx, |v, _| v.state().cloned().unwrap());
+	let mut keys: Vec<String> = serde_json::to_value(&state).unwrap().as_object().unwrap().keys().cloned().collect();
+	keys.extend(["model", "goal", "sessionName", "sessionFile"].map(String::from));
+	cx.update_window(handle, |_, window, _| {
+		for key in &keys {
+			assert!(window.try_find(format!("state-{key}")).is_some(), "panel has no row for {key}");
+		}
+	})
+	.unwrap();
+
+	// Thinking menu: pick the first level that is not the current one.
+	let (levels, current) = view.read_with(cx, |v, _| (v.thinking_levels_for_test(), v.state().unwrap().thinking_level));
+	let (pick, level) = levels.iter().copied().enumerate().find(|(_, l)| Some(*l) != current).expect("another level");
+	cx.update_window(handle, |_, window, cx| {
+		window.click("status-thinking", cx);
+		window.render_frame(cx);
+		window.within("popup-menu").click(pick, cx);
+	})
+	.unwrap();
+	wait_until(cx, Duration::from_secs(20), "thinking level applied", |cx| {
+		view.read_with(cx, |v, _| !v.control_pending() && v.state().unwrap().thinking_level == Some(level))
+	});
+
+	// Model menu: pick another model.
+	let (models, current) = view.read_with(cx, |v, _| {
+		(v.models_for_test(), v.state().unwrap().model.as_ref().map(|m| (m.provider.clone(), m.id.clone())))
+	});
+	let (pick, target) = models.iter().cloned().enumerate().find(|(_, m)| Some(m) != current.as_ref()).expect("another model");
+	cx.update_window(handle, |_, window, cx| {
+		window.render_frame(cx);
+		window.click("status-model", cx);
+		window.render_frame(cx);
+		window.within("popup-menu").click(pick, cx);
+	})
+	.unwrap();
+	wait_until(cx, Duration::from_secs(20), "model applied", |cx| {
+		view.read_with(cx, |v, _| {
+			!v.control_pending() && v.state().unwrap().model.as_ref().map(|m| (m.provider.clone(), m.id.clone())) == Some(target.clone())
+		})
+	});
+
+	// Auto-compact switch.
+	let auto = view.read_with(cx, |v, _| v.state().unwrap().auto_compaction_enabled);
+	cx.update_window(handle, |_, window, cx| {
+		window.render_frame(cx);
+		window.click("panel-auto-compact", cx);
+	})
+	.unwrap();
+	wait_until(cx, Duration::from_secs(20), "auto-compact toggled", |cx| {
+		view.read_with(cx, |v, _| !v.control_pending() && v.state().unwrap().auto_compaction_enabled == !auto)
+	});
+
+	// Compact on an empty session: omp skips it and says why.
+	cx.update_window(handle, |_, window, cx| {
+		window.render_frame(cx);
+		window.click("status-compact", cx);
+	})
+	.unwrap();
+	wait_until(cx, Duration::from_secs(30), "compact reports skip", |cx| {
+		view.read_with(cx, |v, _| {
+			!v.control_pending() && v.notices().iter().any(|n| matches!(n, Notice::Info(t) if t.starts_with("压缩未执行")))
+		})
+	});
+	assert!(
+		view.read_with(cx, |v, _| v.notices().iter().all(|n| !matches!(n, Notice::Error(_)))),
+		"unexpected error notice: {:?}",
+		view.read_with(cx, |v, _| v.notices().to_vec())
+	);
+	cx.update_window(handle, |_, window, cx| window.render_frame(cx)).unwrap();
+	_ = std::fs::remove_dir_all(&dir);
+}
+
+/// A real subagent shows in the panel with live progress; 干预 sends a steer
+/// and 取消 kills it.
+#[gpui_kit::test]
+#[ignore = "spawns omp and calls a model"]
+async fn subagent_panel_steers_and_cancels(cx: &mut TestAppContext) {
+	let (handle, view, dir) = open_chat(cx, "subagent", &["--tools", "task,bash", "--approval-mode", "yolo"]);
+	type_and(
+		cx,
+		handle,
+		"Call the task tool exactly once with a single task (agent: task) whose assignment is: \
+		 run the bash command `sleep 120`, then reply DONE. Do nothing else yourself.",
+		"enter",
+	);
+	wait_until(cx, Duration::from_secs(180), "subagent running", |cx| {
+		view.read_with(cx, |v, _| v.subagents().iter().any(|s| s.running() && s.id.is_some()))
+	});
+	cx.update_window(handle, |_, window, cx| {
+		window.render_frame(cx);
+		window.click("status-subagents", cx);
+		window.render_frame(cx);
+		window.click(("subagent-steer", 0usize), cx);
+		window.render_frame(cx);
+		window.click(("subagent-steer-input", 0usize), cx);
+		window.input("keep going", cx);
+		window.press("enter", cx);
+		window.render_frame(cx);
+	})
+	.unwrap();
+	wait_until(cx, Duration::from_secs(5), "steer input closes", |cx| {
+		cx.update_window(handle, |_, window, _| window.try_find(("subagent-steer-input", 0usize)).is_none()).unwrap()
+	});
+	cx.update_window(handle, |_, window, cx| window.click(("subagent-cancel", 0usize), cx)).unwrap();
+	wait_until(cx, Duration::from_secs(60), "subagent aborted", |cx| {
+		view.read_with(cx, |v, _| v.subagents().first().is_some_and(|s| s.status == omp_rpc::SubagentStatus::Aborted))
+	});
+	let errors: Vec<_> =
+		view.read_with(cx, |v, _| v.notices().iter().filter(|n| matches!(n, Notice::Error(_))).cloned().collect());
+	assert!(errors.is_empty(), "error notices: {errors:?}");
+	cx.update_window(handle, |_, window, cx| window.press("escape", cx)).unwrap();
+	wait_until(cx, Duration::from_secs(120), "run settles", |cx| view.read_with(cx, |v, _| v.is_idle()));
+	_ = std::fs::remove_dir_all(&dir);
+}
