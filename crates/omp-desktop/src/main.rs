@@ -7,6 +7,8 @@ mod attachments;
 mod chat;
 mod dialog;
 mod login;
+mod palette;
+mod palette_view;
 mod session;
 mod slash;
 mod status;

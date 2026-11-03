@@ -18,7 +18,7 @@ use gpui_kit::*;
 use omp_bridge::{Session, SessionOptions};
 use omp_rpc::{
 	AbortCommand, AgentMessage, CancelSubagentCommand, Client, CompactCommand, Event, ForkCommand,
-	GetAvailableModelsCommand, GetAvailableThinkingLevelsCommand, GetSessionStatsCommand, GetStateCommand,
+	CycleThinkingLevelCommand, GetAvailableModelsCommand, GetAvailableThinkingLevelsCommand, GetSessionStatsCommand, GetStateCommand,
 	GetSubagentsCommand, ModelInfo, PromoteQueuedMessageCommand, PromptCommand, QueuedMessageQueue,
 	RemoveQueuedMessageCommand, SessionStats, SetAutoCompactionCommand, SetModelCommand, SetThinkingLevelCommand,
 	SteerSubagentCommand, StreamingBehavior, SubagentStatus, ThinkingLevel,
@@ -867,6 +867,63 @@ impl ChatView {
 		self.control(PendingControl::Thinking, "切换思考档位", move |c| c.call(&SetThinkingLevelCommand { level }), cx);
 	}
 
+	fn cycle_thinking(&mut self, cx: &mut Context<Self>) {
+		self.control(PendingControl::Thinking, "切换思考档位", |c| c.call(&CycleThinkingLevelCommand {}), cx);
+	}
+
+	/// Palette entries that depend on this tab: models, thinking levels, and
+	/// slash commands, with the current model and level marked.
+	pub fn palette_entries(&self) -> Vec<crate::palette::Entry> {
+		use crate::palette::{Command, Entry, Group};
+		let connected = matches!(self.connection, Connection::Connected(_));
+		if !connected {
+			return Vec::new();
+		}
+		let state = self.model.state.as_ref();
+		let current = state.and_then(|s| s.model.as_ref());
+		let level = state.and_then(|s| s.thinking_level);
+		let mut entries: Vec<Entry> = self
+			.models
+			.iter()
+			.map(|m| {
+				Entry::new(Group::Model, m.id.clone(), Command::SetModel { provider: m.provider.clone(), id: m.id.clone() })
+					.detail(if m.name == m.id { m.provider.clone() } else { format!("{} · {}", m.provider, m.name) })
+					.current(current.is_some_and(|c| c.provider == m.provider && c.id == m.id))
+			})
+			.collect();
+		entries.extend(self.thinking_levels.iter().map(|&l| {
+			Entry::new(Group::Thinking, format!("思考 {}", l.as_str()), Command::SetThinking(l)).current(level == Some(l))
+		}));
+		entries.extend(self.model.commands.iter().map(|c| {
+			Entry::new(Group::Slash, format!("/{}", c.name), Command::Slash(c.name.clone()))
+				.detail(c.description.clone().unwrap_or_default())
+		}));
+		entries
+	}
+
+	/// Runs a palette command that belongs to this tab.
+	pub fn run_palette(&mut self, command: crate::palette::Command, window: &mut Window, cx: &mut Context<Self>) {
+		use crate::palette::Command;
+		match command {
+			Command::Compact => self.compact(cx),
+			Command::CycleThinking => self.cycle_thinking(cx),
+			Command::TogglePanel => self.toggle_panel(cx),
+			Command::SetModel { provider, id } => self.set_model(provider, id, cx),
+			Command::SetThinking(level) => self.set_thinking(level, cx),
+			Command::Slash(name) => {
+				let text = format!("/{name} ");
+				self.composer.update(cx, |state, cx| {
+					state.set_value(text.clone(), window, cx);
+					let column = text.chars().count() as u32;
+					state.set_cursor_position(gpui_kit::component::input::Position::new(0, column), window, cx);
+				});
+				self.update_completions(cx);
+			},
+			_ => {},
+		}
+		self.focus_composer(window, cx);
+	}
+
 	fn compact(&mut self, cx: &mut Context<Self>) {
 		self.control(
 			PendingControl::Compact,
@@ -1205,7 +1262,7 @@ impl ChatView {
 				.ghost()
 				.xsmall()
 				.label(current.as_ref().map_or_else(|| "模型".to_owned(), |(_, id)| format!("{id} ▾")))
-				.tooltip("切换模型（仅本会话）")
+				.tooltip("切换模型（仅本会话，⌘M）")
 				.loading(pending == Some(PendingControl::Model))
 				.disabled(!connected || pending.is_some() || models.is_empty())
 				.dropdown_menu_with_anchor(Anchor::BottomRight, move |menu, _, _| {
@@ -1231,7 +1288,7 @@ impl ChatView {
 				.ghost()
 				.xsmall()
 				.label(format!("思考 {} ▾", level.map_or("—", |l| l.as_str())))
-				.tooltip("切换思考档位（仅本会话）")
+				.tooltip("切换思考档位（仅本会话，⌘T 循环）")
 				.loading(pending == Some(PendingControl::Thinking))
 				.disabled(!connected || pending.is_some() || levels.is_empty())
 				.dropdown_menu_with_anchor(Anchor::BottomRight, move |mut menu, _, _| {

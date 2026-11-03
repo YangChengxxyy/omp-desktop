@@ -2,7 +2,8 @@
 //! sidebar listing saved sessions grouped by working directory.
 //!
 //! Shortcuts: ⌘N new tab · ⌘W close tab · ⌘1–9 switch tab · ⌘P search
-//! sessions · ⌘B toggle the sidebar · ⌘⇧L accounts.
+//! sessions · ⌘B toggle the sidebar · ⌘J status panel · ⌘K command palette
+//! · ⌘M pick a model · ⌘T cycle the thinking level · ⌘⇧L accounts.
 
 use std::{
 	collections::HashSet,
@@ -13,6 +14,7 @@ use std::{
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::{ActiveTheme as _, Sizable as _, TitleBar};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
@@ -21,7 +23,9 @@ use omp_store::sessions::{self, Scan, SessionInfo};
 
 use crate::accounts::{AccountsEvent, AccountsView};
 use crate::chat::{ChatEvent, ChatView, TabStatus, TabSummary};
-use crate::theme;
+use crate::palette::{Command, Entry, Group};
+use crate::palette_view::{PaletteEvent, PaletteView};
+use crate::theme::{self, ThemeChoice};
 
 /// The session directory has no change notification we rely on; a scan reads
 /// at most 4 KiB per file, so polling is cheap. Tabs also trigger a rescan
@@ -44,6 +48,8 @@ pub struct Workspace {
 	collapsed:   HashSet<PathBuf>,
 	/// The accounts modal, while open; it runs its own omp process.
 	accounts:    Option<(Entity<AccountsView>, Subscription)>,
+	/// The command palette (⌘K, or ⌘M for models only), while open.
+	palette:     Option<(Entity<PaletteView>, Subscription)>,
 	_tasks:      Vec<Task<()>>,
 	_subs:       Vec<Subscription>,
 }
@@ -76,9 +82,15 @@ impl Workspace {
 			sidebar: true,
 			collapsed: HashSet::new(),
 			accounts: None,
+			palette: None,
 			_tasks: Vec::new(),
 			_subs: vec![sub],
 		};
+		// "Follow the system" tracks appearance changes while running.
+		let appearance = cx.observe_window_appearance(window, |_, window, cx| {
+			theme::appearance_changed(window, cx);
+		});
+		this._subs.push(appearance);
 		this.new_tab(cwd, window, cx);
 		let poll = cx.spawn(async move |this, cx| {
 			loop {
@@ -218,6 +230,85 @@ impl Workspace {
 		cx.notify();
 	}
 
+	/// ⌘K: window actions plus the active tab's models, levels, commands.
+	/// ⌘M: the same palette narrowed to models.
+	pub fn open_palette(&mut self, models_only: bool, window: &mut Window, cx: &mut Context<Self>) {
+		if self.palette.is_some() || self.accounts.is_some() {
+			return;
+		}
+		let tab = self.tabs.get(self.active).map(|tab| tab.view.read(cx).palette_entries()).unwrap_or_default();
+		let entries: Vec<Entry> = if models_only {
+			tab.into_iter().filter(|e| e.group == Group::Model).collect()
+		} else {
+			let theme = theme::choice(cx);
+			let mut entries = vec![
+				Entry::new(Group::Action, "新建会话", Command::NewTab).detail("new tab").shortcut("⌘N"),
+				Entry::new(Group::Action, "关闭会话", Command::CloseTab).detail("close tab").shortcut("⌘W"),
+				Entry::new(Group::Action, "搜索会话", Command::SearchSessions).detail("search sessions").shortcut("⌘P"),
+				Entry::new(Group::Action, "显示 / 隐藏会话栏", Command::ToggleSidebar).detail("sidebar").shortcut("⌘B"),
+				Entry::new(Group::Action, "状态面板", Command::TogglePanel).detail("status panel").shortcut("⌘J"),
+				Entry::new(Group::Action, "循环思考档位", Command::CycleThinking).detail("cycle thinking").shortcut("⌘T"),
+				Entry::new(Group::Action, "压缩上下文", Command::Compact).detail("compact"),
+				Entry::new(Group::Action, "账号与登录", Command::Accounts).detail("accounts login logout").shortcut("⌘⇧L"),
+			];
+			entries.extend(ThemeChoice::ALL.map(|choice| {
+				Entry::new(Group::Action, format!("主题：{}", choice.label()), Command::Theme(choice))
+					.detail("theme appearance")
+					.current(choice == theme)
+			}));
+			entries.extend(tab);
+			entries
+		};
+		let placeholder = if models_only { "切换模型（仅本会话）" } else { "输入命令、模型或 /命令" };
+		let view = cx.new(|cx| PaletteView::new(entries, placeholder, window, cx));
+		let sub = cx.subscribe_in(&view, window, |this, _, event: &PaletteEvent, window, cx| match event {
+			PaletteEvent::Close => this.close_palette(window, cx),
+			PaletteEvent::Run(command) => {
+				let command = command.clone();
+				this.close_palette(window, cx);
+				this.run_command(command, window, cx);
+			},
+		});
+		self.palette = Some((view, sub));
+		cx.notify();
+	}
+
+	fn close_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+		if self.palette.take().is_some()
+			&& let Some(view) = self.tabs.get(self.active).map(|tab| tab.view.clone())
+		{
+			view.update(cx, |view, cx| view.focus_composer(window, cx));
+		}
+		cx.notify();
+	}
+
+	fn run_command(&mut self, command: Command, window: &mut Window, cx: &mut Context<Self>) {
+		match command {
+			Command::NewTab => {
+				let cwd = self.tabs.get(self.active).map_or(self.default_cwd.clone(), |tab| tab.summary.cwd.clone());
+				self.new_tab(cwd, window, cx);
+			},
+			Command::CloseTab => self.close_tab(self.active, window, cx),
+			Command::SearchSessions => self.focus_search(window, cx),
+			Command::ToggleSidebar => {
+				self.sidebar = !self.sidebar;
+				cx.notify();
+			},
+			Command::Accounts => self.open_accounts(window, cx),
+			Command::Theme(choice) => theme::set_choice(choice, window, cx),
+			command => {
+				if let Some(view) = self.tabs.get(self.active).map(|tab| tab.view.clone()) {
+					view.update(cx, |view, cx| view.run_palette(command, window, cx));
+				}
+			},
+		}
+	}
+
+	#[cfg(test)]
+	pub(crate) fn palette_view(&self) -> Option<Entity<PaletteView>> {
+		self.palette.as_ref().map(|(view, _)| view.clone())
+	}
+
 	#[cfg(test)]
 	pub(crate) fn accounts_view(&self) -> Option<Entity<AccountsView>> {
 		self.accounts.as_ref().map(|(view, _)| view.clone())
@@ -236,6 +327,10 @@ impl Workspace {
 		if keystroke.key == "escape" && self.accounts.is_some() {
 			self.close_accounts(window, cx);
 			cx.stop_propagation();
+			return;
+		}
+		// The palette's input handles its own keys (Esc included).
+		if self.palette.is_some() {
 			return;
 		}
 		if !modifiers.secondary(cx) || modifiers.alt {
@@ -259,12 +354,10 @@ impl Workspace {
 				self.sidebar = !self.sidebar;
 				cx.notify();
 			},
-			"j" => {
-				let Some(tab) = self.tabs.get(self.active) else {
-					return;
-				};
-				tab.view.update(cx, |view, cx| view.toggle_panel(cx));
-			},
+			"j" => self.run_command(Command::TogglePanel, window, cx),
+			"t" => self.run_command(Command::CycleThinking, window, cx),
+			"k" => self.open_palette(false, window, cx),
+			"m" => self.open_palette(true, window, cx),
 			key => match key.parse::<usize>() {
 				Ok(n @ 1..=9) => self.activate(n - 1, window, cx),
 				_ => return,
@@ -361,7 +454,22 @@ impl Workspace {
 					)),
 			)
 			.child(
-				div().pr_2().flex().gap_1().child(
+				div().pr_2().flex().gap_1().child({
+					let current = theme::choice(cx);
+					Button::new("theme-menu")
+						.ghost()
+						.xsmall()
+						.label("主题")
+						.tooltip(format!("外观：{}", current.label()))
+						.dropdown_menu_with_anchor(Anchor::TopRight, move |mut menu, _, _| {
+							for choice in ThemeChoice::ALL {
+								menu = menu.item(PopupMenuItem::new(choice.label()).checked(choice == current).on_click(
+									move |_, window, cx| theme::set_choice(choice, window, cx),
+								));
+							}
+							menu
+						})
+				}).child(
 					Button::new("accounts-open")
 						.ghost()
 						.xsmall()
@@ -590,6 +698,21 @@ impl Render for Workspace {
 					.when(self.sidebar, |row| row.child(self.render_sidebar(cx)))
 					.child(div().flex_1().min_w_0().h_full().relative().children(active)),
 			)
+			.when_some(self.palette.as_ref().map(|(view, _)| view.clone()), |root, view| {
+				root.child(
+					div()
+						.id("palette-overlay")
+						.absolute()
+						.inset_0()
+						.flex()
+						.flex_col()
+						.items_center()
+						.pt(px(96.))
+						.bg(hsla(0., 0., 0., 0.2))
+						.on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| this.close_palette(window, cx)))
+						.child(view),
+				)
+			})
 			.when_some(self.accounts.as_ref().map(|(view, _)| view.clone()), |root, view| {
 				root.child(
 					div()

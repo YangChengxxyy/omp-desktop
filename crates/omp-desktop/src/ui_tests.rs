@@ -1142,3 +1142,108 @@ async fn accounts_login_flow_and_logout(cx: &mut TestAppContext) {
 	drop(accounts);
 	_ = std::fs::remove_dir_all(&agent);
 }
+
+struct Blank;
+
+impl gpui_kit::Render for Blank {
+	fn render(&mut self, _: &mut gpui_kit::Window, _: &mut gpui_kit::Context<Self>) -> impl gpui_kit::IntoElement {
+		gpui_kit::div()
+	}
+}
+
+/// Model-free and omp-free: a manual theme choice overrides the system
+/// appearance; "follow the system" goes back to it (the test window is light).
+#[gpui_kit::test]
+async fn theme_choice_overrides_and_follows_system(cx: &mut TestAppContext) {
+	use gpui_kit::component::ActiveTheme as _;
+	use crate::theme::ThemeChoice;
+	cx.update(gpui_kit::init);
+	cx.update(crate::theme::apply);
+	let (handle, _) = cx.update(|cx| gpui_kit::open_window(WindowOptions::default(), cx, |_, cx| cx.new(|_| Blank)).unwrap());
+	let dark = |cx: &mut TestAppContext| cx.read(|cx| (cx.theme().is_dark(), crate::theme::palette(cx).background));
+	assert_eq!(dark(cx), (false, crate::theme::LIGHT.background));
+	for (choice, expect) in [
+		(ThemeChoice::Dark, (true, crate::theme::DARK.background)),
+		(ThemeChoice::Light, (false, crate::theme::LIGHT.background)),
+		(ThemeChoice::Dark, (true, crate::theme::DARK.background)),
+		(ThemeChoice::System, (false, crate::theme::LIGHT.background)),
+	] {
+		cx.update_window(handle, |_, window, cx| crate::theme::set_choice(choice, window, cx)).unwrap();
+		assert_eq!(dark(cx), expect, "{choice:?}");
+		assert_eq!(cx.read(crate::theme::choice), choice);
+	}
+	// An appearance change leaves a manual choice alone.
+	cx.update_window(handle, |_, window, cx| {
+		crate::theme::set_choice(ThemeChoice::Dark, window, cx);
+		crate::theme::appearance_changed(window, cx);
+	})
+	.unwrap();
+	assert!(dark(cx).0);
+}
+
+/// Model-free: ⌘K searches actions, models, and slash commands and runs the
+/// pick; ⌘M narrows to models starting on the current one; ⌘T cycles the
+/// thinking level.
+#[gpui_kit::test]
+#[ignore = "spawns omp"]
+async fn palette_and_model_shortcuts(cx: &mut TestAppContext) {
+	use gpui_kit::component::ActiveTheme as _;
+	let root = std::env::temp_dir().join(format!("omp-desktop-palette-{}", std::process::id()));
+	_ = std::fs::remove_dir_all(&root);
+	std::fs::create_dir_all(root.join("sessions")).unwrap();
+	let (handle, workspace) = open_workspace(cx, &root.join("sessions"), &root);
+	let view = workspace.read_with(cx, |w, _| w.tab_views()[0].clone());
+	wait_until(cx, Duration::from_secs(60), "choices and commands load", |cx| {
+		view.read_with(cx, |v, _| v.is_connected() && v.state().is_some() && v.choices().0 > 1 && v.command_count() > 10)
+	});
+	let press = |cx: &mut TestAppContext, key: &str| {
+		cx.update_window(handle, |_, window, cx| {
+			window.press(key, cx);
+			window.render_frame(cx);
+		})
+		.unwrap()
+	};
+	let typed = |cx: &mut TestAppContext, text: &str| {
+		cx.update_window(handle, |_, window, cx| {
+			window.input(text, cx);
+			window.render_frame(cx);
+		})
+		.unwrap();
+		cx.run_until_parked();
+	};
+	let palette = |cx: &mut TestAppContext| workspace.read_with(cx, |w, _| w.palette_view());
+
+	// ⌘K → theme action.
+	press(cx, "secondary-k");
+	let open = palette(cx).expect("⌘K opens the palette");
+	typed(cx, "主题 深色");
+	assert_eq!(open.read_with(cx, |p, cx| p.titles(cx))[0], "主题：深色");
+	press(cx, "enter");
+	assert!(palette(cx).is_none(), "running a pick closes the palette");
+	assert!(cx.read(|cx| cx.theme().is_dark()));
+
+	// ⌘K → slash command lands in the composer.
+	press(cx, "secondary-k");
+	typed(cx, "/fast");
+	press(cx, "enter");
+	assert_eq!(view.read_with(cx, |v, cx| v.composer_text(cx)), "/fast ");
+
+	// ⌘M: models only, starting on the current one; Esc closes.
+	press(cx, "secondary-m");
+	let models = palette(cx).expect("⌘M opens the model picker");
+	let (titles, selected) = models.read_with(cx, |p, cx| (p.titles(cx), p.selected()));
+	let current = view.read_with(cx, |v, _| v.state().unwrap().model.clone().unwrap());
+	assert_eq!(titles.len(), view.read_with(cx, |v, _| v.choices().0), "models only");
+	assert_eq!(titles[selected], current.id, "starts on the current model");
+	press(cx, "escape");
+	assert!(palette(cx).is_none());
+	assert_eq!(view.read_with(cx, |v, cx| v.composer_text(cx)), "/fast ", "Esc in the palette does not touch the composer");
+
+	// ⌘T cycles the thinking level.
+	let before = view.read_with(cx, |v, _| v.state().unwrap().thinking_level);
+	press(cx, "secondary-t");
+	wait_until(cx, Duration::from_secs(20), "thinking level cycles", |cx| {
+		view.read_with(cx, |v, _| !v.control_pending() && v.state().unwrap().thinking_level != before)
+	});
+	_ = std::fs::remove_dir_all(&root);
+}

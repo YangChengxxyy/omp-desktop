@@ -1,11 +1,108 @@
-//! Maps the DESIGN.md tokens onto gpui-kit's theme, following the system
-//! appearance at launch.
+//! Maps the DESIGN.md tokens onto gpui-kit's theme. The user picks light,
+//! dark, or "follow the system"; the last one tracks appearance changes
+//! live (see `Workspace`). The choice is saved across launches.
+
+use std::path::PathBuf;
 
 use gpui_kit::component::theme::{Theme, ThemeMode};
 use gpui_kit::*;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ThemeChoice {
+	#[default]
+	System,
+	Light,
+	Dark,
+}
+
+impl ThemeChoice {
+	pub const ALL: [Self; 3] = [Self::System, Self::Light, Self::Dark];
+
+	pub fn label(self) -> &'static str {
+		match self {
+			Self::System => "跟随系统",
+			Self::Light => "浅色",
+			Self::Dark => "深色",
+		}
+	}
+
+	fn key(self) -> &'static str {
+		match self {
+			Self::System => "system",
+			Self::Light => "light",
+			Self::Dark => "dark",
+		}
+	}
+
+	fn parse(text: &str) -> Option<Self> {
+		Self::ALL.into_iter().find(|c| c.key() == text.trim())
+	}
+
+	fn is_dark(self, appearance: WindowAppearance) -> bool {
+		match self {
+			Self::System => matches!(appearance, WindowAppearance::Dark | WindowAppearance::VibrantDark),
+			Self::Light => false,
+			Self::Dark => true,
+		}
+	}
+}
+
+struct Choice(ThemeChoice);
+
+impl Global for Choice {}
+
+pub fn choice(cx: &App) -> ThemeChoice {
+	cx.try_global::<Choice>().map(|c| c.0).unwrap_or_default()
+}
+
+/// Startup: the saved choice against the system appearance.
 pub fn apply(cx: &mut App) {
-	let dark = matches!(cx.window_appearance(), WindowAppearance::Dark | WindowAppearance::VibrantDark);
+	let choice = if cfg!(test) { ThemeChoice::System } else { load().unwrap_or_default() };
+	cx.set_global(Choice(choice));
+	let appearance = cx.window_appearance();
+	paint(choice.is_dark(appearance), cx);
+}
+
+/// The window appearance changed; matters only when following the system.
+pub fn appearance_changed(window: &mut Window, cx: &mut App) {
+	if choice(cx) == ThemeChoice::System {
+		paint(ThemeChoice::System.is_dark(window.appearance()), cx);
+		window.refresh();
+	}
+}
+
+/// A pick from the theme menu: applies and saves it.
+pub fn set_choice(choice: ThemeChoice, window: &mut Window, cx: &mut App) {
+	cx.set_global(Choice(choice));
+	paint(choice.is_dark(window.appearance()), cx);
+	window.refresh();
+	if !cfg!(test) {
+		save(choice);
+	}
+}
+
+fn settings_file() -> Option<PathBuf> {
+	let home = std::env::var_os("HOME")?;
+	Some(PathBuf::from(home).join("Library/Application Support/omp-desktop/theme"))
+}
+
+fn load() -> Option<ThemeChoice> {
+	ThemeChoice::parse(&std::fs::read_to_string(settings_file()?).ok()?)
+}
+
+fn save(choice: ThemeChoice) {
+	let Some(file) = settings_file() else {
+		return;
+	};
+	if let Some(dir) = file.parent() {
+		_ = std::fs::create_dir_all(dir);
+	}
+	if let Err(error) = std::fs::write(&file, choice.key()) {
+		eprintln!("omp-desktop: saving the theme to {}: {error}", file.display());
+	}
+}
+
+fn paint(dark: bool, cx: &mut App) {
 	Theme::change(if dark { ThemeMode::Dark } else { ThemeMode::Light }, None, cx);
 	let p = if dark { &DARK } else { &LIGHT };
 	Theme::update(cx, |theme| {
@@ -22,6 +119,24 @@ pub fn apply(cx: &mut App) {
 		theme.warning = rgb(p.warning).into();
 		theme.success = rgb(p.success).into();
 	});
+}
+
+#[cfg(test)]
+mod tests {
+	use super::{ThemeChoice, WindowAppearance};
+
+	#[test]
+	fn choice_round_trips_and_resolves() {
+		for choice in ThemeChoice::ALL {
+			assert_eq!(ThemeChoice::parse(choice.key()), Some(choice));
+		}
+		assert_eq!(ThemeChoice::parse("dark\n"), Some(ThemeChoice::Dark));
+		assert_eq!(ThemeChoice::parse("blue"), None);
+		assert!(ThemeChoice::System.is_dark(WindowAppearance::VibrantDark));
+		assert!(!ThemeChoice::System.is_dark(WindowAppearance::Light));
+		assert!(ThemeChoice::Dark.is_dark(WindowAppearance::Light));
+		assert!(!ThemeChoice::Light.is_dark(WindowAppearance::Dark));
+	}
 }
 
 /// Agent-specific tokens gpui-kit has no slot for.
