@@ -1,0 +1,22 @@
+crates/omp-desktop/src/chat.rs
+  s_eb23452c38ebfe::t_a2b454932896e9 112-114,176,411-415,997,1001-1004,1006-1008
+crates/omp-desktop/src/ui_tests.rs
+  s_eb23452c38ebfe::t_a2b454932896e9 724
+  s_eb23452c38ebfe::t_bf7ac62c93a899 722-723
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.51-trip",
+  "base_commit_sha": "cef92340bbf83c2ed10963e0e21bbc3daedf9de3",
+  "prompts": {},
+  "sessions": {
+    "s_eb23452c38ebfe": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "01a19fe5-da37-7571-934c-a3e63205c6ba",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "YangChengxxyy <yangc27@trip.com>"
+    }
+  }
+}
