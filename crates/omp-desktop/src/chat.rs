@@ -109,6 +109,9 @@ pub struct ChatView {
 	panel:        bool,
 	/// Steer input per subagent id, created when its 干预 button is pressed.
 	steer_inputs: std::collections::HashMap<String, (Entity<InputState>, Subscription)>,
+	/// `steer_subagent` calls not yet answered (omp answers once the
+	/// subagent starts the steered turn).
+	steers_in_flight: usize,
 	list:         ListState,
 	composer:     Entity<TextareaState>,
 	dialog:       Option<Entity<DialogView>>,
@@ -170,6 +173,7 @@ impl ChatView {
 			thinking_levels: Vec::new(),
 			panel: false,
 			steer_inputs: Default::default(),
+			steers_in_flight: 0,
 			list,
 			composer,
 			dialog: None,
@@ -402,6 +406,11 @@ impl ChatView {
 	#[cfg(test)]
 	pub(crate) fn state(&self) -> Option<&omp_rpc::SessionState> {
 		self.model.state.as_ref()
+	}
+
+	#[cfg(test)]
+	pub(crate) fn steers_in_flight(&self) -> usize {
+		self.steers_in_flight
 	}
 
 	#[cfg(test)]
@@ -985,15 +994,18 @@ impl ChatView {
 			return;
 		};
 		self.steer_inputs.remove(&subagent_id);
+		self.steers_in_flight += 1;
 		cx.notify();
 		let call = cx.background_spawn(async move { client.call(&SteerSubagentCommand { subagent_id, message }) });
 		cx.spawn(async move |this, cx| {
-			if let Err(error) = call.await {
-				_ = this.update(cx, |this, cx| {
+			let result = call.await;
+			_ = this.update(cx, |this, cx| {
+				this.steers_in_flight -= 1;
+				if let Err(error) = result {
 					this.model.notices.push(Notice::Error(format!("干预子 agent 失败：{error}")));
-					cx.notify();
-				});
-			}
+				}
+				cx.notify();
+			});
 		})
 		.detach();
 	}

@@ -719,6 +719,9 @@ async fn subagent_panel_steers_and_cancels(cx: &mut TestAppContext) {
 	wait_until(cx, Duration::from_secs(5), "steer input closes", |cx| {
 		cx.update_window(handle, |_, window, _| window.try_find(("subagent-steer-input", 0usize)).is_none()).unwrap()
 	});
+	// The steer and the cancel go out on separate threads; cancelling before
+	// omp answers the steer can overtake it ("Subagent not running").
+	wait_until(cx, Duration::from_secs(60), "steer answered", |cx| view.read_with(cx, |v, _| v.steers_in_flight() == 0));
 	cx.update_window(handle, |_, window, cx| window.click(("subagent-cancel", 0usize), cx)).unwrap();
 	wait_until(cx, Duration::from_secs(60), "subagent aborted", |cx| {
 		view.read_with(cx, |v, _| v.subagents().first().is_some_and(|s| s.status == omp_rpc::SubagentStatus::Aborted))
