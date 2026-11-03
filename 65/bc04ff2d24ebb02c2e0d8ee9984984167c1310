@@ -1,0 +1,33 @@
+crates/omp-desktop/src/palette.rs
+  s_eb23452c38ebfe::t_6a178fd6d0e48c 1-154
+crates/omp-desktop/src/theme.rs
+  s_eb23452c38ebfe::t_1dffa443625563 126
+  s_eb23452c38ebfe::t_9b24953547a3dd 55
+  s_eb23452c38ebfe::t_2692b0719e6df1 1-5,10-54,56-58,60-105,124-125,127-139
+crates/omp-desktop/src/main.rs
+  s_eb23452c38ebfe::t_298c4e89bda105 10-11
+crates/omp-desktop/src/ui_tests.rs
+  s_eb23452c38ebfe::t_5a20d59fa2c269 1145-1249
+crates/omp-desktop/src/chat.rs
+  s_eb23452c38ebfe::t_4d29a55eaf999b 21,870-926,1265,1291
+crates/omp-desktop/src/workspace.rs
+  s_eb23452c38ebfe::t_298c4e89bda105 5-6,17,26-28,51-52,85,89-93,233-311,332-335,357-360,457-472,701-715
+crates/omp-desktop/src/palette_view.rs
+  s_eb23452c38ebfe::t_6d5d4196a85eda 1-158
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.51-trip",
+  "base_commit_sha": "65bc04ff2d24ebb02c2e0d8ee9984984167c1310",
+  "prompts": {},
+  "sessions": {
+    "s_eb23452c38ebfe": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "01a19fe5-da37-7571-934c-a3e63205c6ba",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "YangChengxxyy <yangc27@trip.com>"
+    }
+  }
+}
