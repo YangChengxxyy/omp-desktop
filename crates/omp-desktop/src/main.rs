@@ -6,6 +6,7 @@ mod accounts;
 mod attachments;
 mod chat;
 mod dialog;
+mod launch_env;
 mod login;
 mod palette;
 mod palette_view;
@@ -22,8 +23,14 @@ use gpui_kit::component::TitleBar;
 use gpui_kit::*;
 
 fn main() {
+	// Before anything else: it may `set_var` PATH (Finder launches lack it).
+	launch_env::import_shell_path();
 	let args = Args::parse(std::env::args().skip(1));
-	let options = omp_bridge::SessionOptions { session_dir: args.session_dir, ..Default::default() };
+	let options = omp_bridge::SessionOptions {
+		omp: launch_env::locate_omp(),
+		session_dir: args.session_dir,
+		..Default::default()
+	};
 	gpui_kit::application().run(move |cx| {
 		gpui_kit::init(cx);
 		theme::apply(cx);
@@ -59,7 +66,7 @@ impl Args {
 			}
 		}
 		Self {
-			cwd: cwd.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))),
+			cwd: cwd.unwrap_or_else(launch_env::default_cwd),
 			session_dir,
 		}
 	}

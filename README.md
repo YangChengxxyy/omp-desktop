@@ -4,7 +4,7 @@ A desktop client for [omp](https://github.com/can1357/oh-my-pi), written in Rust
 
 ## Requirements
 
-- omp ≥ 18.13.3 on `PATH` (`brew install can1357/tap/omp`)
+- omp ≥ 18.13.3 (`brew install can1357/tap/omp`). The app uses the first `omp` on your login shell's PATH, then `/opt/homebrew/bin`, `/usr/local/bin`, `~/.local/bin`.
 - Rust 1.88+ (edition 2024)
 
 ## Run
@@ -16,6 +16,16 @@ cargo run -p omp-desktop -- --session-dir /tmp/s # store and list sessions there
 ```
 
 Each tab runs its own omp process. The sidebar lists saved sessions from `~/.omp/agent/sessions` grouped by directory, including ones started in the TUI; click one to resume it, 分支 to fork it into a new file.
+
+## macOS app
+
+```bash
+scripts/bundle-macos.sh             # target/bundle/omp-desktop.app + omp-desktop-<ver>-<arch>.dmg, ad-hoc signed
+scripts/bundle-macos.sh --no-dmg    # .app only
+scripts/bundle-macos.sh --sign "Developer ID Application: Name (TEAMID)" --notarize <profile>
+```
+
+The ad-hoc build runs on this machine; on another Mac, Gatekeeper blocks it until it is opened with right-click → 打开 (or `xattr -dr com.apple.quarantine omp-desktop.app`). A distributable build needs a Developer ID certificate in the keychain and a notarytool profile saved once with `xcrun notarytool store-credentials <profile> --apple-id … --team-id … --password <app-specific password>`; the script then signs with the hardened runtime, submits the .dmg, waits, and staples the ticket. omp is not bundled. Launched from Finder, the app takes PATH from `$SHELL -l -i` (so omp and the tools it runs resolve as in a terminal) and starts the first tab in the home directory. The icon is drawn by `scripts/make-icon.swift`.
 
 ## Shortcuts
 
@@ -57,7 +67,8 @@ Queued messages appear as chips above the composer: × withdraws one, 插队 pro
 | `vendor/omp-rpc` | Official RPC client crate, pinned to omp tag `v18.13.3` (`UPSTREAM`) |
 | `crates/omp-bridge` | Spawns omp, checks version/protocol, enables delta updates and the ask dialog, exposes an async event stream |
 | `crates/omp-store` | Rebuilds messages from events; projects them to renderable blocks; lists saved sessions |
-| `crates/omp-desktop` | The GPUI app |
+| `crates/omp-desktop` | The GPUI app; `assets/` holds the icon and the Info.plist template |
+| `scripts/` | `bundle-macos.sh` (.app/.dmg, signing, notarization), `make-icon.swift` |
 | `docs/` | Technical plan and UI design (`docs/design/`) |
 
 ## Tests
