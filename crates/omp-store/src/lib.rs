@@ -12,6 +12,7 @@
 //! stream produced.
 
 pub mod display;
+pub mod sessions;
 pub mod tools;
 
 use std::collections::HashMap;

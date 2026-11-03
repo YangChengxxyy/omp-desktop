@@ -76,15 +76,38 @@ impl From<omp_rpc::Error> for BridgeError {
 /// How to launch one session process.
 #[derive(Debug, Clone)]
 pub struct SessionOptions {
-	pub omp:        PathBuf,
-	pub cwd:        Option<PathBuf>,
-	/// Extra launch flags (`--resume <file>`, `--no-session`, …).
-	pub extra_args: Vec<String>,
+	pub omp:         PathBuf,
+	pub cwd:         Option<PathBuf>,
+	/// Session file to continue (`--resume <file>`); `None` starts a new one.
+	pub resume:      Option<PathBuf>,
+	/// Session storage root (`--session-dir`). `None` keeps omp's default
+	/// (`~/.omp/agent/sessions/<encoded-cwd>/`); a custom root is flat.
+	pub session_dir: Option<PathBuf>,
+	/// Extra launch flags (`--no-session`, `--thinking off`, …).
+	pub extra_args:  Vec<String>,
 }
 
 impl Default for SessionOptions {
 	fn default() -> Self {
-		Self { omp: PathBuf::from("omp"), cwd: None, extra_args: Vec::new() }
+		Self { omp: PathBuf::from("omp"), cwd: None, resume: None, session_dir: None, extra_args: Vec::new() }
+	}
+}
+
+impl SessionOptions {
+	/// Arguments after `omp`.
+	pub fn args(&self) -> Vec<std::ffi::OsString> {
+		let mut args: Vec<std::ffi::OsString> = vec!["--mode".into(), "rpc-ui".into()];
+		if let Some(dir) = &self.session_dir {
+			args.extend(["--session-dir".into(), dir.into()]);
+		}
+		if let Some(file) = &self.resume {
+			args.extend(["--resume".into(), file.into()]);
+		}
+		args.extend(self.extra_args.iter().map(Into::into));
+		if let Some(cwd) = &self.cwd {
+			args.extend(["--cwd".into(), cwd.into()]);
+		}
+		args
 	}
 }
 
@@ -115,10 +138,7 @@ impl Session {
 	pub fn spawn(options: &SessionOptions) -> Result<Self, BridgeError> {
 		let version = check_version(&options.omp)?;
 		let mut process = Process::new(&options.omp);
-		process.args(["--mode", "rpc-ui"]).args(&options.extra_args);
-		if let Some(cwd) = &options.cwd {
-			process.arg("--cwd").arg(cwd);
-		}
+		process.args(options.args());
 		let (client, receiver) = Client::spawn(process, ClientOptions::default())?;
 		let supported = client.ready().supported_protocol_versions.clone().unwrap_or_default();
 		if client.protocol_version() != 2 {

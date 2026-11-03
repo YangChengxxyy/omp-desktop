@@ -78,6 +78,19 @@ impl DialogView {
 		crate::session::dialog_id(&self.request).unwrap_or_default()
 	}
 
+	/// The request method, for tests.
+	#[cfg(test)]
+	pub(crate) fn kind(&self) -> &'static str {
+		match &self.request {
+			ExtensionUiRequest::Select(_) => "select",
+			ExtensionUiRequest::Confirm(_) => "confirm",
+			ExtensionUiRequest::Input(_) => "input",
+			ExtensionUiRequest::Editor(_) => "editor",
+			ExtensionUiRequest::Ask(_) => "ask",
+			_ => "other",
+		}
+	}
+
 	#[cfg(test)]
 	pub(crate) fn select_options(&self) -> Option<Vec<String>> {
 		match &self.request {
@@ -193,11 +206,11 @@ impl Render for DialogView {
 			},
 			ExtensionUiRequest::Input(input) => (
 				input.title.clone(),
-				Input::new(self.text.as_ref().expect("input state")).into_any_element(),
+				div().id("dialog-input").child(Input::new(self.text.as_ref().expect("input state"))).test_support().into_any_element(),
 			),
 			ExtensionUiRequest::Editor(editor) => (
 				editor.title.clone(),
-				Textarea::new(self.area.as_ref().expect("editor state")).into_any_element(),
+				div().id("dialog-editor").child(Textarea::new(self.area.as_ref().expect("editor state"))).test_support().into_any_element(),
 			),
 			ExtensionUiRequest::Ask(ask) => {
 				let questions = ask.questions.iter().enumerate().map(|(qi, question)| {

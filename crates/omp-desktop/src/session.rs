@@ -36,6 +36,10 @@ pub struct SessionModel {
 	pub notices:    Vec<Notice>,
 	pub status:     Option<String>,
 	pub queue:      Queue,
+	/// Every queue state seen, for tests: a steer is delivered within moments,
+	/// so the current queue alone cannot show that it was queued.
+	#[cfg(test)]
+	pub queue_log:  Vec<Queue>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -111,6 +115,8 @@ impl SessionModel {
 			RpcAgentEvent::ModelChanged(_) | RpcAgentEvent::TurnEnd(_) => effects.refresh_state = true,
 			RpcAgentEvent::QueueUpdate(update) => {
 				self.queue = Queue { steering: update.steering.clone(), follow_up: update.follow_up.clone() };
+				#[cfg(test)]
+				self.queue_log.push(self.queue.clone());
 			},
 			_ => {},
 		}
@@ -158,6 +164,24 @@ impl SessionModel {
 	/// row renderer collapses them).
 	pub fn row_count(&self) -> usize {
 		self.transcript.entries().len()
+	}
+
+	/// Replaces the conversation with a resumed session's history. Each
+	/// message goes through `message_end`, so tool results attach to their
+	/// cards exactly as they do live.
+	pub fn load_history(&mut self, messages: Vec<omp_rpc::AgentMessage>) {
+		self.transcript = Transcript::default();
+		self.tools = Default::default();
+		self.tool_rows.clear();
+		for message in messages {
+			let end = RpcAgentEvent::MessageEnd(omp_rpc::MessageEndEvent { message, message_id: None });
+			self.apply_event(end, &mut Effects::default());
+		}
+	}
+
+	/// Whether a dialog waits for the user (the tab shows a warning dot).
+	pub fn needs_attention(&self) -> bool {
+		!self.dialogs.is_empty()
 	}
 }
 
@@ -265,5 +289,24 @@ mod tests {
 			"args":{},"partialResult":{"content":[{"type":"text","text":"a.rs"}]}}));
 		assert_eq!(effects.rows, Some((1, 3)));
 		assert_eq!(m.tools.get("c1").unwrap().output, "a.rs");
+	}
+	#[test]
+	fn history_attaches_tool_results_to_their_call() {
+		let mut m = SessionModel::default();
+		let messages = [
+			json!({"role":"user","content":[{"type":"text","text":"ls"}],"timestamp":1}),
+			json!({"role":"assistant","content":[{"type":"toolCall","id":"c1","name":"bash","arguments":{"command":"ls"}}],"timestamp":2}),
+			json!({"role":"toolResult","toolCallId":"c1","toolName":"bash","content":[{"type":"text","text":"a.rs"}],"isError":false,"timestamp":3}),
+		]
+		.map(|v| omp_rpc::AgentMessage::from_value(v).expect("message"));
+		m.load_history(messages.to_vec());
+		assert_eq!(m.row_count(), 3);
+		assert_eq!(m.tool_rows.get("c1"), Some(&1));
+		assert_eq!(m.tools.get("c1").unwrap().output, "a.rs");
+		assert!(!m.busy());
+		// Reloading replaces rather than appends.
+		m.load_history(messages[..1].to_vec());
+		assert_eq!(m.row_count(), 1);
+		assert!(m.tools.get("c1").is_none());
 	}
 }

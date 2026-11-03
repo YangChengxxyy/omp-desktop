@@ -1,5 +1,5 @@
-//! The main window: conversation stream, composer, status bar, and the
-//! dialog overlay for one omp session.
+//! One session tab: conversation stream, composer, status bar, and the
+//! dialog overlay for one omp process.
 
 use std::{path::PathBuf, sync::Arc};
 
@@ -12,8 +12,8 @@ use gpui_kit::prelude::*;
 use gpui_kit::*;
 use omp_bridge::{Session, SessionOptions};
 use omp_rpc::{
-	AbortCommand, Client, Event, GetSessionStatsCommand, GetStateCommand, PromoteQueuedMessageCommand,
-	PromptCommand, QueuedMessageQueue, RemoveQueuedMessageCommand, StreamingBehavior,
+	AbortCommand, AgentMessage, Client, Event, ForkCommand, GetSessionStatsCommand, GetStateCommand,
+	PromoteQueuedMessageCommand, PromptCommand, QueuedMessageQueue, RemoveQueuedMessageCommand, StreamingBehavior,
 };
 use omp_store::display::{Block, Role, View};
 
@@ -40,26 +40,62 @@ enum Connection {
 	Failed(String),
 }
 
+/// What a tab shows in the tab bar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TabStatus {
+	Connecting,
+	Idle,
+	Running,
+	/// A dialog waits for the user.
+	Attention,
+	Disconnected,
+}
+
+/// The parts of a tab the workspace renders outside the tab itself.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TabSummary {
+	pub status:       TabStatus,
+	pub name:         Option<String>,
+	pub session_file: Option<PathBuf>,
+	pub cwd:          PathBuf,
+}
+
 pub struct ChatView {
-	cwd:        PathBuf,
-	options:    SessionOptions,
-	connection: Connection,
-	model:      SessionModel,
-	cost:       Option<f64>,
-	list:       ListState,
-	composer:   Entity<TextareaState>,
-	dialog:     Option<Entity<DialogView>>,
+	cwd:          PathBuf,
+	options:      SessionOptions,
+	/// Fork the resumed session right after connecting (`fork` command), so
+	/// the tab continues in a new file and the original stays untouched.
+	fork:         bool,
+	connection:   Connection,
+	/// From `get_state`. For a new session the file appears on disk only
+	/// after the first message.
+	session_file: Option<PathBuf>,
+	model:        SessionModel,
+	cost:         Option<f64>,
+	list:         ListState,
+	composer:     Entity<TextareaState>,
+	dialog:       Option<Entity<DialogView>>,
 	/// Thinking blocks the user expanded, by (row, block).
-	expanded:   std::collections::HashSet<(usize, usize)>,
+	expanded:     std::collections::HashSet<(usize, usize)>,
 	/// Abort requests sent, for tests that check one key press aborts once.
 	#[cfg(test)]
 	pub(crate) aborts: usize,
-	_tasks:     Vec<Task<()>>,
-	_subs:      Vec<Subscription>,
+	_tasks:       Vec<Task<()>>,
+	_subs:        Vec<Subscription>,
 }
 
 impl ChatView {
+	/// A tab for `options`: a new session, or `options.resume`.
 	pub fn new(options: SessionOptions, window: &mut Window, cx: &mut Context<Self>) -> Self {
+		Self::build(options, false, window, cx)
+	}
+
+	/// A tab that resumes `options.resume` and forks it into a new file.
+	pub fn fork(options: SessionOptions, window: &mut Window, cx: &mut Context<Self>) -> Self {
+		Self::build(options, true, window, cx)
+	}
+
+	fn build(options: SessionOptions, fork: bool, window: &mut Window, cx: &mut Context<Self>) -> Self {
 		let cwd = options.cwd.clone().unwrap_or_else(|| PathBuf::from("."));
 		let composer = cx.new(|cx| {
 			TextareaState::new(window, cx)
@@ -78,7 +114,9 @@ impl ChatView {
 
 		let mut view = Self {
 			cwd,
+			session_file: options.resume.as_ref().map(|f| std::fs::canonicalize(f).unwrap_or_else(|_| f.clone())),
 			options,
+			fork,
 			connection: Connection::Connecting,
 			model: SessionModel::default(),
 			cost: None,
@@ -98,10 +136,26 @@ impl ChatView {
 	fn connect(&mut self, cx: &mut Context<Self>) {
 		self.connection = Connection::Connecting;
 		let options = self.options.clone();
-		let spawn = cx.background_spawn(async move { Session::spawn(&options) });
+		let fork = self.fork;
+		// Spawn, fork, and load history off the UI thread. Events that arrive
+		// meanwhile wait in the channel and apply after the history.
+		let spawn = cx.background_spawn(async move {
+			let session = Session::spawn(&options)?;
+			let mut notice = None;
+			if fork {
+				match session.client.call(&ForkCommand::default()) {
+					Ok(result) if result.cancelled => notice = Some(Notice::Error("fork 被扩展取消".into())),
+					Ok(_) => {},
+					Err(error) => notice = Some(Notice::Error(format!("fork 失败：{error}"))),
+				}
+			}
+			let history: Vec<AgentMessage> =
+				if options.resume.is_some() { session.client.get_messages()? } else { Vec::new() };
+			Ok::<_, omp_bridge::BridgeError>((session, history, notice))
+		});
 		let task = cx.spawn(async move |this, cx| {
-			let session = match spawn.await {
-				Ok(session) => session,
+			let (session, history, notice) = match spawn.await {
+				Ok(started) => started,
 				Err(error) => {
 					_ = this.update(cx, |this, cx| {
 						this.connection = Connection::Failed(error.to_string());
@@ -113,6 +167,11 @@ impl ChatView {
 			let events = session.events.clone();
 			let client = session.client.clone();
 			_ = this.update(cx, |this, cx| {
+				if !history.is_empty() {
+					this.model.load_history(history);
+					this.list.reset(this.model.row_count());
+				}
+				this.model.notices.extend(notice);
 				this.connection = Connection::Connected(client);
 				this.refresh_state(cx);
 				cx.notify();
@@ -135,6 +194,50 @@ impl ChatView {
 		self._tasks.push(task);
 	}
 
+	/// Restarts the process after it exited. A session that reached disk
+	/// continues from its file (`--resume`); otherwise a new one starts.
+	fn reconnect(&mut self, cx: &mut Context<Self>) {
+		if let Some(file) = self.session_file.clone().filter(|file| file.is_file()) {
+			self.options.resume = Some(file);
+		}
+		self.fork = false;
+		self.model = SessionModel::default();
+		self.dialog = None;
+		self.list.reset(0);
+		self.connect(cx);
+		cx.notify();
+	}
+
+	/// Stops the process. Teardown waits for the process group, so the last
+	/// client handle is dropped off the UI thread.
+	pub fn shutdown(&mut self, cx: &mut Context<Self>) {
+		let old = std::mem::replace(&mut self.connection, Connection::Failed("已关闭".into()));
+		self._tasks.clear();
+		if let Connection::Connected(client) = old {
+			cx.background_spawn(async move { drop(client) }).detach();
+		}
+	}
+
+	pub fn summary(&self) -> TabSummary {
+		let status = match &self.connection {
+			Connection::Connecting => TabStatus::Connecting,
+			Connection::Failed(_) => TabStatus::Disconnected,
+			Connection::Connected(_) if self.model.needs_attention() => TabStatus::Attention,
+			Connection::Connected(_) if self.model.busy() => TabStatus::Running,
+			Connection::Connected(_) => TabStatus::Idle,
+		};
+		TabSummary {
+			status,
+			name: self.model.state.as_ref().and_then(|s| s.session_name.clone()).filter(|n| !n.trim().is_empty()),
+			session_file: self.session_file.clone(),
+			cwd: self.cwd.clone(),
+		}
+	}
+
+	pub fn focus_composer(&self, window: &mut Window, cx: &mut App) {
+		self.composer.update(cx, |state, cx| state.focus(window, cx));
+	}
+
 	fn client(&self) -> Option<Arc<Client>> {
 		match &self.connection {
 			Connection::Connected(client) => Some(client.clone()),
@@ -145,6 +248,36 @@ impl ChatView {
 	#[cfg(test)]
 	pub(crate) fn is_connected(&self) -> bool {
 		matches!(self.connection, Connection::Connected(_))
+	}
+
+	#[cfg(test)]
+	pub(crate) fn is_disconnected(&self) -> bool {
+		matches!(self.connection, Connection::Failed(_))
+	}
+
+	#[cfg(test)]
+	pub(crate) fn pid(&self) -> Option<u32> {
+		self.client()?.pid()
+	}
+
+	#[cfg(test)]
+	pub(crate) fn queue_log(&self) -> &[crate::session::Queue] {
+		&self.model.queue_log
+	}
+
+	#[cfg(test)]
+	pub(crate) fn session_file(&self) -> Option<&std::path::Path> {
+		self.session_file.as_deref()
+	}
+
+	#[cfg(test)]
+	pub(crate) fn notices(&self) -> &[Notice] {
+		&self.model.notices
+	}
+
+	#[cfg(test)]
+	pub(crate) fn open_dialog_kind(&self, cx: &App) -> Option<&'static str> {
+		Some(self.dialog.as_ref()?.read(cx).kind())
 	}
 
 	#[cfg(test)]
@@ -215,8 +348,13 @@ impl ChatView {
 		cx.spawn(async move |this, cx| {
 			let (state, stats) = fetch.await;
 			_ = this.update(cx, |this, cx| {
-				if state.is_some() {
-					this.model.state = state;
+				if let Some(state) = state {
+					if let Some(file) = &state.session_file {
+						let file = PathBuf::from(file);
+						// Canonical once the file exists, to match the session list.
+						this.session_file = Some(std::fs::canonicalize(&file).unwrap_or(file));
+					}
+					this.model.state = Some(state);
 				}
 				if let Some(stats) = stats {
 					this.cost = Some(stats.cost);
@@ -698,12 +836,12 @@ impl ChatView {
 					.bg(rgb(p.code))
 					.child("brew install can1357/tap/omp"),
 			)
-			.child(Button::new("reconnect").primary().label("重新连接").on_click(cx.listener(|this, _, _, cx| {
-				this.model = SessionModel::default();
-				this.list.reset(0);
-				this.connect(cx);
-				cx.notify();
-			})))
+			.child(
+				Button::new("reconnect")
+					.primary()
+					.label("重新连接")
+					.on_click(cx.listener(|this, _, _, cx| this.reconnect(cx))),
+			)
 			.into_any_element()
 	}
 }
@@ -769,12 +907,12 @@ impl Render for ChatView {
 						.text_color(rgb(0xFFFFFF))
 						.text_sm()
 						.child(format!("已断开：{error}"))
-						.child(Button::new("reconnect-banner").small().label("重新连接").on_click(cx.listener(|this, _, _, cx| {
-							this.model = SessionModel::default();
-							this.list.reset(0);
-							this.connect(cx);
-							cx.notify();
-						}))),
+						.child(
+							Button::new("reconnect-banner")
+								.small()
+								.label("重新连接")
+								.on_click(cx.listener(|this, _, _, cx| this.reconnect(cx))),
+						),
 				)
 			})
 			.child(body)

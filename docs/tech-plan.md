@@ -111,7 +111,10 @@ flowchart LR
 RPC 协议里没有"列出历史会话"的命令，所以客户端直接只读扫描 `~/.omp/agent/sessions/<encoded-cwd>/*.jsonl`：
 
 - 第一行是 `{"type":"title",...}`，后面紧跟 `{"type":"session","id","cwd","timestamp"}`，只读文件开头 4 KiB。
-- 按 mtime 倒序排列，用 `notify` crate 监听目录变化。
+- 按 mtime 倒序排列。没有用 `notify` crate：每 3 秒在后台线程重扫一次（每个文件只读 4 KiB），tab 的会话文件出现或回合结束时立即重扫。
+- 两种目录布局：默认 `<root>/<encoded-cwd>/<file>.jsonl`；`--session-dir <root>` 时是平铺的 `<root>/<file>.jsonl`。与会话文件同名（去掉 `.jsonl`）的目录是它的附件（子 agent 记录、工具日志），跳过。
+- 新会话在发送第一条消息之前不会落盘，所以不出现在列表里；`get_state.sessionFile` 先给出路径。
+- `fork` 会生成新文件，header 带 `parentSession`；原文件不变。
 - 风险：这是 omp 内部格式，不是公开契约。解析要宽松，解析失败的文件跳过、不报错，并锁定支持的 `version`。
 - 打开会话时交给 omp 处理（`--resume <path>`），客户端不自己解释会话内容；对话历史通过 `get_messages`（v2 下自动分页）获取。
 
@@ -141,8 +144,8 @@ omp-desktop/
 | --- | --- | --- |
 | M0 骨架（已完成） | workspace、vendor omp-rpc（tag `v18.13.3`）、`omp-bridge` 拉起进程并转成 async 事件流、`SetEventFilterDelta` 命令、版本与协议检测 | `cargo run -p omp-bridge --example stream` 发一个 prompt，按 `messageId` 用增量重建出回复，结果和 `message_end` 一致。实测：工具调用、thinking、正文 3 种 block 全部一致，0 处不一致 |
 | M1 单会话对话（已完成） | GPUI 窗口；消息流（Markdown、代码块、thinking 折叠）；输入框（中文 IME、多行、图片粘贴）；发送 / abort | 已完成：消息流、Markdown、thinking 折叠、工具调用卡片与结果、多行输入、发送/abort/排队、对话框（select/confirm/input/editor/ask）、状态栏、断开重连。无头窗口测试连真实 omp 通过（发送→流式回复；always-ask 下审批弹窗→点击批准→文件写入）；中文 IME 用户手动验证通过。未完成：图片粘贴 |
-| M2 工具与交互（已完成） | 工具调用卡片（bash 输出、edit diff、read）；ask/approval/confirm 对话框；队列 chip（steer/follow-up、移除、提升） | 已完成：bash 实时输出与耗时、edit 带行号的 diff 与 +/- 统计、read 单行摘要、失败标红、长输出折叠；运行中 Enter 排队、⌘Enter 插队、空输入框 Esc 停止、chip 撤回/提升。无头窗口 + 真实 omp 测试覆盖：ask 多选+自由输入回传；运行中排队→撤回→输入法组字时 Esc 不中断→空输入框 Esc 只发一次 abort 并停止；edit diff（+2/-2）；一次性审批。已实现但无端到端测试：⌘Enter 插队、chip 提升为插队、confirm/input/editor 对话框、断开重连 |
-| M3 会话管理 | 侧栏会话列表（按项目分组、搜索）；打开/新建/fork；多 tab 多进程；断线重连 | 在 TUI 里新建的会话会出现在列表中，并能在客户端继续对话 |
+| M2 工具与交互（已完成） | 工具调用卡片（bash 输出、edit diff、read）；ask/approval/confirm 对话框；队列 chip（steer/follow-up、移除、提升） | 已完成：bash 实时输出与耗时、edit 带行号的 diff 与 +/- 统计、read 单行摘要、失败标红、长输出折叠；运行中 Enter 排队、⌘Enter 插队、空输入框 Esc 停止、chip 撤回/提升。无头窗口 + 真实 omp 测试覆盖：ask 多选+自由输入回传；运行中排队→撤回→输入法组字时 Esc 不中断→空输入框 Esc 只发一次 abort 并停止；edit diff（+2/-2）；一次性审批；⌘Enter 排成 steer 并在工具边界注入；chip「插队」把 follow-up 提升为 steer 并在 `sleep 60` 结束前送达；confirm/input/editor 由测试扩展 `tests/fixtures/dialogs.ts` 触发（不调模型）并校验回传值 |
+| M3 会话管理（已完成） | 侧栏会话列表（按项目分组、搜索）；打开/新建/fork；多 tab 多进程；断线重连 | 已完成：标题栏多 tab（每个 tab 一个 omp 进程，状态点：连接中/就绪/运行中/待确认/已断开）；侧栏按 cwd 分组、可折叠、按标题/路径/id 搜索、相对时间、已打开标记、跳过计数；点击会话以 `--resume` 打开（已打开则切过去）并通过 `get_messages` 回放历史；「分支」以 `--resume` + `fork` 在新文件继续；「定位」在 Finder 中显示 JSONL；关闭 tab 回收进程组，关闭最后一个 tab 时新开一个；断线后重连用 `--resume <sessionFile>` 续上；快捷键 ⌘N/⌘W/⌘1–9/⌘P/⌘B；`--session-dir` 透传。验收测试（无头 + 真实 omp）：`omp -p` 在外部建的会话出现在列表，打开后历史可见，继续对话能答出之前的暗号且写回原文件；kill -9 进程后点重连恢复历史；fork 出新文件且列表多一条；⌘W 后对应进程退出 |
 | M4 状态与控制 | 模型/思考档位切换、上下文用量、费用、compact、todo 面板、子 agent 面板（progress 订阅、取消、steer） | `get_state` 的各个字段都能在界面上看到 |
 | M5 打磨与发布 | login/logout 流程、slash 命令补全（`available_commands_update`）、主题、快捷键、macOS 签名与公证、Windows/Linux 构建 | 安装包在一台没有开发环境的机器上能跑通 M1–M4 |
 
