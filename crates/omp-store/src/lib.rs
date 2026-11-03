@@ -23,6 +23,9 @@ use omp_rpc::{
 };
 use serde_json::{Map, Value};
 
+/// `customType` of the local rows that hold slash-command output.
+pub const COMMAND_OUTPUT: &str = "omp-desktop/command-output";
+
 /// One message in display order.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Entry {
@@ -146,6 +149,22 @@ impl Transcript {
 			Some(id) => self.by_id.get(id).copied(),
 			None => self.entries.iter().rposition(|entry| entry.streaming),
 		}
+	}
+
+	/// Appends the text of a `command_output` notification as a local row;
+	/// returns its index.
+	pub fn push_command_output(&mut self, text: &str) -> usize {
+		let id = self.local_id();
+		let message = AgentMessage::Custom(omp_rpc::CustomMessage {
+			role: Some(omp_rpc::LitCustom),
+			custom_type: Some(COMMAND_OUTPUT.to_owned()),
+			content: Some(omp_rpc::MessageContent::String(text.to_owned())),
+			display: Some(true),
+			..Default::default()
+		});
+		self.entries.push(Entry { id: id.clone(), message, streaming: false, tool_args: HashMap::new() });
+		self.by_id.insert(id, self.entries.len() - 1);
+		self.entries.len() - 1
 	}
 
 	fn local_id(&mut self) -> String {

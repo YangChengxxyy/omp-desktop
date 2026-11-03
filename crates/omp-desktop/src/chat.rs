@@ -4,7 +4,9 @@
 use std::{path::PathBuf, sync::Arc};
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{Input, InputEvent, InputState, Paste, Textarea, TextareaState};
+use gpui_kit::component::input::{
+	Enter, Escape, IndentInline, Input, InputEvent, InputState, MoveDown, MoveUp, Paste, Textarea, TextareaState,
+};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::progress::Progress;
 use gpui_kit::component::switch::Switch;
@@ -26,6 +28,7 @@ use omp_store::display::{Block, Role, View};
 use crate::attachments;
 use crate::dialog::{self, DialogEvent, DialogView};
 use crate::session::{Activity, Notice, PendingControl, SessionModel};
+use crate::slash;
 use crate::status;
 use crate::theme;
 use crate::tool_card::{ToolCard, clip_lines, truncate};
@@ -34,6 +37,15 @@ use crate::tool_card::{ToolCard, clip_lines, truncate};
 enum Delivery {
 	Normal,
 	Steer,
+}
+
+#[derive(Clone, Copy)]
+enum CompletionKey {
+	Up,
+	Down,
+	Tab,
+	Enter,
+	Escape,
 }
 
 enum QueueAction {
@@ -46,7 +58,16 @@ enum Connection {
 	Connected(Arc<Client>),
 	/// Startup failed or the process went away.
 	Failed(String),
+	/// omp quit at startup because no model has usable credentials.
+	NeedsLogin(String),
 }
+
+/// Requests the workspace handles.
+pub enum ChatEvent {
+	OpenAccounts,
+}
+
+impl EventEmitter<ChatEvent> for ChatView {}
 
 /// What a tab shows in the tab bar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,6 +112,10 @@ pub struct ChatView {
 	list:         ListState,
 	composer:     Entity<TextareaState>,
 	dialog:       Option<Entity<DialogView>>,
+	/// Slash-command completions for the composer text, with the selected
+	/// row; `None` hides the popup. Esc dismisses it until the text changes.
+	completions:  Option<(Vec<slash::Suggestion>, usize)>,
+	completions_dismissed: Option<String>,
 	/// Images waiting in the composer, sent with the next message.
 	attachments:  Vec<attachments::Attachment>,
 	/// Decoded transcript images by (row, block); cleared with the list.
@@ -127,6 +152,7 @@ impl ChatView {
 		let sub = cx.subscribe_in(&composer, window, |this, _, event, window, cx| match event {
 			InputEvent::PressEnter { secondary: true, .. } => this.send(Delivery::Steer, window, cx),
 			InputEvent::PressEnter { shift: false, .. } => this.send(Delivery::Normal, window, cx),
+			InputEvent::Change => this.update_completions(cx),
 			_ => {},
 		});
 		let list = ListState::new(0, ListAlignment::Top, px(600.));
@@ -148,6 +174,8 @@ impl ChatView {
 			composer,
 			dialog: None,
 			attachments: Vec::new(),
+			completions: None,
+			completions_dismissed: None,
 			images: Default::default(),
 			expanded: Default::default(),
 			#[cfg(test)]
@@ -184,7 +212,11 @@ impl ChatView {
 				Ok(started) => started,
 				Err(error) => {
 					_ = this.update(cx, |this, cx| {
-						this.connection = Connection::Failed(error.to_string());
+						this.connection = if error.needs_login() {
+							Connection::NeedsLogin(error.to_string())
+						} else {
+							Connection::Failed(error.to_string())
+						};
 						cx.notify();
 					});
 					return;
@@ -237,6 +269,13 @@ impl ChatView {
 		cx.notify();
 	}
 
+	/// Retries a tab that could not start, after credentials changed.
+	pub fn reconnect_if_failed(&mut self, cx: &mut Context<Self>) {
+		if matches!(self.connection, Connection::Failed(_) | Connection::NeedsLogin(_)) && self.model.row_count() == 0 {
+			self.reconnect(cx);
+		}
+	}
+
 	/// Stops the process. Teardown waits for the process group, so the last
 	/// client handle is dropped off the UI thread.
 	pub fn shutdown(&mut self, cx: &mut Context<Self>) {
@@ -250,7 +289,7 @@ impl ChatView {
 	pub fn summary(&self) -> TabSummary {
 		let status = match &self.connection {
 			Connection::Connecting => TabStatus::Connecting,
-			Connection::Failed(_) => TabStatus::Disconnected,
+			Connection::Failed(_) | Connection::NeedsLogin(_) => TabStatus::Disconnected,
 			Connection::Connected(_) if self.model.needs_attention() => TabStatus::Attention,
 			Connection::Connected(_) if self.model.busy() => TabStatus::Running,
 			Connection::Connected(_) => TabStatus::Idle,
@@ -281,7 +320,7 @@ impl ChatView {
 
 	#[cfg(test)]
 	pub(crate) fn is_disconnected(&self) -> bool {
-		matches!(self.connection, Connection::Failed(_))
+		matches!(self.connection, Connection::Failed(_) | Connection::NeedsLogin(_))
 	}
 
 	#[cfg(test)]
@@ -317,6 +356,16 @@ impl ChatView {
 	#[cfg(test)]
 	pub(crate) fn transcript(&self) -> &omp_store::Transcript {
 		&self.model.transcript
+	}
+
+	#[cfg(test)]
+	pub(crate) fn completion_labels(&self) -> Option<(Vec<String>, usize)> {
+		self.completions.as_ref().map(|(rows, selected)| (rows.iter().map(|r| r.label.clone()).collect(), *selected))
+	}
+
+	#[cfg(test)]
+	pub(crate) fn command_count(&self) -> usize {
+		self.model.commands.len()
 	}
 
 	#[cfg(test)]
@@ -492,12 +541,28 @@ impl ChatView {
 			Delivery::Steer => StreamingBehavior::Steer,
 		});
 		self.composer.update(cx, |state, cx| state.clean(window, cx));
+		self.completions = None;
+		let was_busy = self.model.busy();
 		self.model.prompt_sent();
 		let call = cx.background_spawn(async move {
 			client.call(&PromptCommand { message: text, images: wire, streaming_behavior })
 		});
 		cx.spawn(async move |this, cx| {
-			if let Err(error) = call.await {
+			let error = match call.await {
+				// A builtin slash command ran without the agent: no
+				// `prompt_result` or `session_settled` follows.
+				Ok(ack) if ack.agent_invoked == Some(false) && !was_busy => {
+					_ = this.update(cx, |this, cx| {
+						this.model.activity = Default::default();
+						this.refresh_state(cx);
+						cx.notify();
+					});
+					return;
+				},
+				Ok(_) => return,
+				Err(error) => error,
+			};
+			{
 				_ = this.update(cx, |this, cx| {
 					this.model.notices.push(Notice::Error(format!("发送失败：{error}")));
 					this.model.activity = Default::default();
@@ -594,6 +659,132 @@ impl ChatView {
 			_ = client.call(&AbortCommand {});
 		})
 		.detach();
+	}
+
+	fn update_completions(&mut self, cx: &mut Context<Self>) {
+		let text = self.composer.read(cx).value().to_string();
+		if self.completions_dismissed.as_deref() != Some(text.as_str()) {
+			self.completions_dismissed = None;
+		}
+		let rows = if self.completions_dismissed.is_some() {
+			None
+		} else {
+			slash::suggest(&self.model.commands, &text).filter(|rows| !rows.is_empty())
+		};
+		let selected = match (&self.completions, &rows) {
+			// Keep the selection on the same row while typing narrows the list.
+			(Some((old, index)), Some(new)) => {
+				old.get(*index).and_then(|row| new.iter().position(|r| r.label == row.label)).unwrap_or(0)
+			},
+			_ => 0,
+		};
+		self.completions = rows.map(|rows| (rows, selected));
+		cx.notify();
+	}
+
+	/// ↑/↓ move, Tab/Enter accept, Esc closes, while the popup is open;
+	/// stops the key's action when it was used.
+	fn completion_key(&mut self, key: CompletionKey, window: &mut Window, cx: &mut Context<Self>) {
+		let Some((count, selected)) = self.completions.as_ref().map(|(rows, selected)| (rows.len(), *selected)) else {
+			return;
+		};
+		let select = |this: &mut Self, index: usize| {
+			if let Some((_, selected)) = &mut this.completions {
+				*selected = index;
+			}
+		};
+		match key {
+			CompletionKey::Up => select(self, selected.checked_sub(1).unwrap_or(count - 1)),
+			CompletionKey::Down => select(self, (selected + 1) % count),
+			CompletionKey::Tab => self.accept_completion(selected, window, cx),
+			CompletionKey::Enter => {
+				// Enter on a fully typed command sends it; otherwise it completes.
+				let insert = self.completions.as_ref().map(|(rows, _)| rows[selected].insert.clone()).unwrap_or_default();
+				let text = self.composer.read(cx).value().to_string();
+				if insert.trim_end() == text.trim_end() {
+					self.completions = None;
+					return;
+				}
+				self.accept_completion(selected, window, cx)
+			},
+			CompletionKey::Escape => {
+				self.completions = None;
+				self.completions_dismissed = Some(self.composer.read(cx).value().to_string());
+			},
+		}
+		cx.stop_propagation();
+		cx.notify();
+	}
+
+	fn accept_completion(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+		let Some(row) = self.completions.as_ref().and_then(|(rows, _)| rows.get(index)).cloned() else {
+			return;
+		};
+		self.composer.update(cx, |state, cx| {
+			state.set_value(row.insert.clone(), window, cx);
+			let column = row.insert.chars().count() as u32;
+			state.set_cursor_position(gpui_kit::component::input::Position::new(0, column), window, cx);
+		});
+		// `set_value` emits no change event.
+		self.update_completions(cx);
+	}
+
+	fn render_completions(&self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
+		let (rows, selected) = self.completions.as_ref()?;
+		let p = theme::palette(cx);
+		let selected = *selected;
+		Some(
+			div()
+				.id("slash-popup")
+				.absolute()
+				.bottom_full()
+				.left_0()
+				.mb_1()
+				.w(px(520.))
+				.max_h(px(280.))
+				.overflow_y_scroll()
+				.rounded(px(8.))
+				.border_1()
+				.border_color(rgb(p.border))
+				.bg(rgb(p.elevated))
+				.shadow_lg()
+				.py_1()
+				.children(rows.iter().enumerate().map(|(index, row)| {
+					div()
+						.id(("slash-row", index))
+						.flex()
+						.items_baseline()
+						.gap_2()
+						.px_3()
+						.py_1()
+						.text_xs()
+						.cursor_pointer()
+						.when(index == selected, |r| r.bg(rgb(p.accent)))
+						.hover(|r| r.bg(rgb(p.muted)))
+						.child(div().flex_none().font_family("Menlo").text_color(rgb(p.foreground)).child(row.label.clone()))
+						.when_some(row.hint.clone(), |r, hint| {
+							r.child(div().flex_none().font_family("Menlo").text_color(rgb(p.muted_foreground)).child(hint))
+						})
+						.when_some(row.alias.clone(), |r, alias| {
+							r.child(div().flex_none().text_color(rgb(p.muted_foreground)).child(format!("别名 /{alias}")))
+						})
+						.child(
+							div()
+								.flex_1()
+								.min_w_0()
+								.truncate()
+								.text_color(rgb(p.muted_foreground))
+								.child(row.description.clone().unwrap_or_default()),
+						)
+						.child(div().flex_none().text_color(rgb(p.muted_foreground)).child(slash::source_label(row.source)))
+						.on_click(cx.listener(move |this, _, window, cx| {
+							this.accept_completion(index, window, cx);
+							this.focus_composer(window, cx);
+						}))
+						.test_support()
+				}))
+				.test_support(),
+		)
 	}
 
 	/// Esc in an empty composer stops the agent; with text it keeps the
@@ -844,6 +1035,27 @@ impl ChatView {
 					col.child(div().text_sm().text_color(rgb(p.danger)).child(format!("错误：{error}")))
 				})
 				.into_any_element(),
+			Role::Command => {
+				let text = view.blocks.iter().filter_map(|b| if let Block::Output(t) = b { Some(t.as_str()) } else { None }).collect::<Vec<_>>().join("\n");
+				content
+					.py_1()
+					.child(
+						div()
+							.id(("command-output", index))
+							.rounded(px(6.))
+							.border_l_2()
+							.border_color(rgb(p.border))
+							.bg(rgb(p.panel))
+							.px_3()
+							.py_1p5()
+							.font_family("Menlo")
+							.text_xs()
+							.text_color(rgb(p.muted_foreground))
+							.child(text)
+							.test_support(),
+					)
+					.into_any_element()
+			},
 			// Shown inside the card of the call that produced it; a result with
 			// no matching call (history from an older run) falls back here.
 			Role::ToolResult { tool_call_id, .. } if self.model.tool_rows.contains_key(tool_call_id) => {
@@ -974,7 +1186,7 @@ impl ChatView {
 		let p = theme::palette(cx);
 		let (dot, label) = match (&self.connection, self.model.activity()) {
 			(Connection::Connecting, _) => (p.warning, "连接中".to_owned()),
-			(Connection::Failed(_), _) => (p.danger, "已断开".to_owned()),
+			(Connection::Failed(_) | Connection::NeedsLogin(_), _) => (p.danger, "已断开".to_owned()),
 			(Connection::Connected(_), Activity::Idle) => (p.success, "就绪".to_owned()),
 			(Connection::Connected(_), Activity::Running) => (p.primary, "运行中".to_owned()),
 			(Connection::Connected(_), Activity::Settling) => (p.primary, "收尾中".to_owned()),
@@ -1395,10 +1607,32 @@ impl ChatView {
 					.child(
 						div()
 							.flex_1()
+							.relative()
+							.children(self.render_completions(cx))
 							.capture_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-								if event.keystroke.key == "escape" {
+								if event.keystroke.key == "escape" && this.completions.is_none() {
 									this.on_escape(cx);
 								}
+							}))
+							// The input binds these keys to actions, which dispatch
+							// before key-down listeners; take them while the
+							// completion popup is open.
+							.capture_action(cx.listener(|this, _: &MoveUp, window, cx| {
+								this.completion_key(CompletionKey::Up, window, cx)
+							}))
+							.capture_action(cx.listener(|this, _: &MoveDown, window, cx| {
+								this.completion_key(CompletionKey::Down, window, cx)
+							}))
+							.capture_action(cx.listener(|this, _: &IndentInline, window, cx| {
+								this.completion_key(CompletionKey::Tab, window, cx)
+							}))
+							.capture_action(cx.listener(|this, action: &Enter, window, cx| {
+								if !action.secondary && !action.shift {
+									this.completion_key(CompletionKey::Enter, window, cx)
+								}
+							}))
+							.capture_action(cx.listener(|this, _: &Escape, window, cx| {
+								this.completion_key(CompletionKey::Escape, window, cx)
 							}))
 							// Images on the clipboard attach; text pastes as usual.
 							.capture_action(cx.listener(|this, _: &Paste, _, cx| {
@@ -1460,6 +1694,41 @@ impl ChatView {
 			}))
 	}
 
+	fn render_needs_login(&self, error: &str, cx: &mut Context<Self>) -> AnyElement {
+		let p = theme::palette(cx);
+		div()
+			.id("needs-login")
+			.flex_1()
+			.flex()
+			.flex_col()
+			.items_center()
+			.justify_center()
+			.gap_3()
+			.child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child("还没有可用的模型"))
+			.child(
+				div()
+					.max_w(px(560.))
+					.text_sm()
+					.text_color(rgb(p.muted_foreground))
+					.child("omp 找不到带凭据的模型。登录一个 provider（或设置 ANTHROPIC_API_KEY 等环境变量）后再连接。"),
+			)
+			.child(div().max_w(px(560.)).text_xs().font_family("Menlo").text_color(rgb(p.muted_foreground)).child(error.to_owned()))
+			.child(
+				div()
+					.flex()
+					.gap_2()
+					.child(
+						Button::new("needs-login-open")
+							.primary()
+							.label("登录 provider")
+							.on_click(cx.listener(|_, _, _, cx| cx.emit(ChatEvent::OpenAccounts))),
+					)
+					.child(Button::new("reconnect").outline().label("重新连接").on_click(cx.listener(|this, _, _, cx| this.reconnect(cx)))),
+			)
+			.test_support()
+			.into_any_element()
+	}
+
 	fn render_failed(&self, error: &str, cx: &mut Context<Self>) -> AnyElement {
 		let p = theme::palette(cx);
 		div()
@@ -1496,6 +1765,7 @@ impl Render for ChatView {
 		let p = theme::palette(cx);
 		let body = match &self.connection {
 			Connection::Failed(error) if self.model.row_count() == 0 => self.render_failed(&error.clone(), cx),
+			Connection::NeedsLogin(error) => self.render_needs_login(&error.clone(), cx),
 			_ if self.model.row_count() == 0 => div()
 				.flex_1()
 				.flex()

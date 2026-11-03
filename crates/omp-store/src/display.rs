@@ -12,6 +12,9 @@ pub enum Role {
 	Assistant,
 	/// A tool's result, attached under the call that produced it.
 	ToolResult { tool_call_id: String, tool_name: String, is_error: bool },
+	/// Output of a builtin slash command (`command_output`), shown in place.
+	/// Local only: omp does not keep it in the session.
+	Command,
 	/// Messages the conversation view does not render (developer notes,
 	/// hooks, summaries…).
 	Hidden,
@@ -61,6 +64,12 @@ impl Entry {
 					Some(MessageContent::String(text)) => view.blocks.push(Block::Text(text.clone())),
 					Some(MessageContent::UserContentList(parts)) => view.blocks.extend(parts.iter().map(user_block)),
 					None => {},
+				}
+			},
+			AgentMessage::Custom(custom) if custom.custom_type.as_deref() == Some(crate::COMMAND_OUTPUT) => {
+				view.role = Role::Command;
+				if let Some(MessageContent::String(text)) = &custom.content {
+					view.blocks.push(Block::Output(text.clone()));
 				}
 			},
 			AgentMessage::Assistant(message) => {

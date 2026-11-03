@@ -880,3 +880,265 @@ async fn dropped_image_files_attach(cx: &mut TestAppContext) {
 	cx.update_window(handle, |_, window, _| assert!(window.try_find(("attachment", 0usize)).is_some())).unwrap();
 	_ = std::fs::remove_dir_all(&dir);
 }
+
+/// No model call: `/` opens completions from omp's catalog; typing narrows,
+/// ↓ moves, Tab completes a command and then its subcommand, Esc hides the
+/// popup, and Enter on the full command runs it in omp, whose output shows
+/// in the transcript without the composer staying busy.
+#[gpui_kit::test]
+#[ignore = "spawns omp"]
+async fn slash_commands_complete_and_run(cx: &mut TestAppContext) {
+	let (handle, view, dir) = open_chat(cx, "slash", &["--no-tools"]);
+	wait_until(cx, Duration::from_secs(30), "command catalog", |cx| view.read_with(cx, |v, _| v.command_count() > 10));
+	let popup = |cx: &mut TestAppContext| view.read_with(cx, |v, _| v.completion_labels());
+	let key = |cx: &mut TestAppContext, key: &str| {
+		cx.update_window(handle, |_, window, cx| {
+			window.press(key, cx);
+			window.render_frame(cx);
+		})
+		.unwrap();
+	};
+
+	cx.update_window(handle, |_, window, cx| {
+		window.render_frame(cx);
+		window.click("composer", cx);
+		window.input("/", cx);
+	})
+	.unwrap();
+	cx.run_until_parked();
+	cx.update_window(handle, |_, window, cx| {
+		window.render_frame(cx);
+		assert!(window.try_find("slash-popup").is_some(), "popup not shown");
+	})
+	.unwrap();
+	let (all, _) = popup(cx).expect("popup");
+	assert!(all.len() > 10 && all.iter().any(|l| l == "/fast"), "{all:?}");
+
+	cx.update_window(handle, |_, window, cx| window.input("fa", cx)).unwrap();
+	let (rows, selected) = popup(cx).expect("narrowed");
+	assert_eq!((rows[0].as_str(), selected), ("/fast", 0), "{rows:?}");
+
+	// Tab completes the command, then offers its subcommands.
+	key(cx, "tab");
+	assert_eq!(view.read_with(cx, |v, cx| v.composer_text(cx)), "/fast ");
+	let (subs, _) = popup(cx).expect("subcommands");
+	assert!(subs.contains(&"/fast status".to_owned()), "{subs:?}");
+	let status = subs.iter().position(|s| s == "/fast status").unwrap();
+	for _ in 0..status {
+		key(cx, "down");
+	}
+	assert_eq!(popup(cx).unwrap().1, status);
+	key(cx, "enter");
+	assert_eq!(view.read_with(cx, |v, cx| v.composer_text(cx)), "/fast status ", "Enter completes a partial line");
+	assert!(popup(cx).is_none(), "exact subcommand closes the popup");
+
+	// Esc hides the popup without clearing the text or aborting.
+	cx.update_window(handle, |_, window, cx| {
+		window.press("backspace", cx);
+		window.press("backspace", cx);
+	})
+	.unwrap();
+	assert!(popup(cx).is_some(), "editing reopens it");
+	key(cx, "escape");
+	assert!(popup(cx).is_none());
+	assert_eq!(view.read_with(cx, |v, cx| v.composer_text(cx)), "/fast statu");
+	assert!(view.read_with(cx, |v, _| v.is_idle()), "Esc on the popup must not abort");
+
+	cx.update_window(handle, |_, window, cx| {
+		window.input("s", cx);
+		window.press("enter", cx);
+	})
+	.unwrap();
+	wait_until(cx, Duration::from_secs(20), "command output", |cx| {
+		view.read_with(cx, |v, _| {
+			v.rows().iter().any(|r| r.role == Role::Command && matches!(&r.blocks[..], [Block::Output(t)] if t.contains("Fast mode")))
+		})
+	});
+	wait_until(cx, Duration::from_secs(10), "composer idle", |cx| view.read_with(cx, |v, _| v.is_idle()));
+	assert_eq!(view.read_with(cx, |v, cx| v.composer_text(cx)), "");
+	assert!(view.read_with(cx, |v, _| v.assistant_text().is_none()), "a builtin command must not call the model");
+	cx.update_window(handle, |_, window, cx| window.render_frame(cx)).unwrap();
+	_ = std::fs::remove_dir_all(&dir);
+}
+
+/// A scratch `PI_CODING_AGENT_DIR` holding the given fake API-key
+/// credentials, so login tests never touch `~/.omp`.
+fn scratch_agent_dir(name: &str, providers: &[&str]) -> std::path::PathBuf {
+	let dir = std::env::temp_dir().join(format!("omp-desktop-agent-{name}-{}", std::process::id()));
+	_ = std::fs::remove_dir_all(&dir);
+	std::fs::create_dir_all(&dir).unwrap();
+	if !providers.is_empty() {
+		let credentials: Vec<_> = providers
+			.iter()
+			.map(|p| serde_json::json!({"provider": p, "credential": {"type": "api_key", "key": "fake-omp-desktop-test"}}))
+			.collect();
+		let file = dir.join("import.json");
+		std::fs::write(&file, serde_json::json!({"version": 1, "credentials": credentials}).to_string()).unwrap();
+		let status = std::process::Command::new("omp")
+			.args(["auth", "import"])
+			.arg(&file)
+			.env("PI_CODING_AGENT_DIR", &dir)
+			.stdout(std::process::Stdio::null())
+			.status()
+			.unwrap();
+		assert!(status.success(), "omp auth import");
+	}
+	dir
+}
+
+/// Model-free: with no credentials omp quits at startup; the tab says so and
+/// offers the accounts panel instead of a generic failure.
+#[gpui_kit::test]
+#[ignore = "spawns omp"]
+async fn missing_credentials_point_to_login(cx: &mut TestAppContext) {
+	cx.executor().allow_parking();
+	cx.update(gpui_kit::init);
+	cx.update(crate::theme::apply);
+	let agent = scratch_agent_dir("nologin", &[]);
+	let sessions = std::env::temp_dir().join(format!("omp-desktop-nologin-sessions-{}", std::process::id()));
+	_ = std::fs::remove_dir_all(&sessions);
+	std::fs::create_dir_all(&sessions).unwrap();
+	let mut env = vec![("PI_CODING_AGENT_DIR".to_owned(), agent.display().to_string())];
+	// Provider keys in the test environment would let omp start.
+	for (key, _) in std::env::vars() {
+		if key.ends_with("_API_KEY") || key.ends_with("_OAUTH_TOKEN") {
+			env.push((key, String::new()));
+		}
+	}
+	let base = SessionOptions {
+		session_dir: Some(sessions.clone()),
+		extra_args: ["--thinking", "off", "--no-tools"].map(String::from).to_vec(),
+		env,
+		..Default::default()
+	};
+	let cwd = sessions.clone();
+	let (handle, workspace) = cx.update(|cx| {
+		gpui_kit::open_window(
+			WindowOptions {
+				window_bounds: Some(WindowBounds::Windowed(Bounds { origin: Point::default(), size: size(px(1200.), px(800.)) })),
+				..Default::default()
+			},
+			cx,
+			|window, cx| cx.new(|cx| Workspace::new(base, cwd, window, cx)),
+		)
+		.expect("open window")
+	});
+	wait_until(cx, Duration::from_secs(60), "needs-login screen", |cx| {
+		cx.update_window(handle, |_, window, cx| {
+			window.render_frame(cx);
+			window.try_find("needs-login").is_some()
+		})
+		.unwrap()
+	});
+	cx.update_window(handle, |_, window, cx| {
+		window.click("needs-login-open", cx);
+		window.render_frame(cx);
+	})
+	.unwrap();
+	let accounts = workspace.read_with(cx, |w, _| w.accounts_view()).expect("accounts panel opened");
+	// The panel's own process starts despite the missing credentials.
+	wait_until(cx, Duration::from_secs(60), "accounts connect", |cx| accounts.read_with(cx, |v, _| v.connected()));
+	assert!(accounts.read_with(cx, |v, _| v.providers().len() > 10));
+	assert!(accounts.read_with(cx, |v, _| v.providers().iter().all(|p| !p.authenticated)), "placeholder key is not stored");
+	cx.update_window(handle, |_, window, cx| {
+		window.press("escape", cx);
+	})
+	.unwrap();
+	assert!(workspace.read_with(cx, |w, _| w.accounts_view()).is_none());
+	_ = std::fs::remove_dir_all(&agent);
+	_ = std::fs::remove_dir_all(&sessions);
+}
+
+/// Model-free, in a scratch agent dir: the accounts panel lists providers
+/// with the stored one marked, search narrows the list, a login shows the
+/// authorize link (opened in the browser, copyable) and the code prompt,
+/// cancelling restarts cleanly, and logout removes the credential after a
+/// confirmation.
+#[gpui_kit::test]
+#[ignore = "spawns omp"]
+async fn accounts_login_flow_and_logout(cx: &mut TestAppContext) {
+	cx.executor().allow_parking();
+	cx.update(gpui_kit::init);
+	cx.update(crate::theme::apply);
+	let agent = scratch_agent_dir("accounts", &["openrouter"]);
+	let base = SessionOptions { env: vec![("PI_CODING_AGENT_DIR".to_owned(), agent.display().to_string())], ..Default::default() };
+	let (handle, accounts) = cx.update(|cx| {
+		gpui_kit::open_window(
+			WindowOptions {
+				window_bounds: Some(WindowBounds::Windowed(Bounds { origin: Point::default(), size: size(px(900.), px(800.)) })),
+				..Default::default()
+			},
+			cx,
+			|window, cx| cx.new(|cx| crate::accounts::AccountsView::new(&base, window, cx)),
+		)
+		.expect("open window")
+	});
+	wait_until(cx, Duration::from_secs(60), "accounts connect", |cx| accounts.read_with(cx, |v, _| v.connected()));
+	let authenticated = |cx: &mut TestAppContext| {
+		accounts.read_with(cx, |v, _| v.providers().iter().filter(|p| p.authenticated).map(|p| p.id.clone()).collect::<Vec<_>>())
+	};
+	assert_eq!(authenticated(cx), ["openrouter"]);
+
+	// The stored provider sorts first; search narrows to codex.
+	cx.update_window(handle, |_, window, cx| {
+		window.render_frame(cx);
+		assert!(window.try_find(("provider-accounts", 0usize)).is_some(), "authenticated row offers its accounts");
+		window.click("accounts-search", cx);
+		window.input("codex device", cx);
+		window.render_frame(cx);
+		// openai-codex-device only.
+		assert!(window.try_find(("provider", 1usize)).is_none(), "search narrows to one row");
+		window.click(("provider-login", 0usize), cx);
+	})
+	.unwrap();
+	wait_until(cx, Duration::from_secs(30), "device login shows its link", |cx| {
+		accounts.read_with(cx, |v, _| v.flow().is_some_and(|f| f.url.is_some()))
+	});
+	let url = accounts.read_with(cx, |v, _| v.flow().unwrap().url.clone().unwrap());
+	let login_pid = accounts.read_with(cx, |v, _| v.login_pid()).expect("login process");
+	assert_eq!(cx.opened_url().as_deref(), Some(url.as_str()), "the browser opens the authorize URL");
+	cx.update_window(handle, |_, window, cx| {
+		window.render_frame(cx);
+		window.click("login-copy", cx);
+	})
+	.unwrap();
+	let copied = cx.read_from_clipboard().and_then(|item| item.text()).unwrap_or_default();
+	assert_eq!(Some(copied.as_str()), accounts.read_with(cx, |v, _| v.flow().unwrap().copy_url.clone()).as_deref());
+
+	cx.update_window(handle, |_, window, cx| window.click("login-cancel", cx)).unwrap();
+	assert!(accounts.read_with(cx, |v, _| v.flow().is_none()));
+	wait_until(cx, Duration::from_secs(60), "restarted after cancel", |cx| accounts.read_with(cx, |v, _| v.connected()));
+	assert_eq!(authenticated(cx), ["openrouter"], "cancel stored nothing");
+	wait_until(cx, Duration::from_secs(10), "cancelled login process exits", |_| !process_alive(login_pid));
+
+	// Logout: list the account, confirm, and it is gone.
+	cx.update_window(handle, |_, window, cx| {
+		window.click("accounts-search", cx);
+		window.press("cmd-a", cx);
+		window.press("backspace", cx);
+		window.render_frame(cx);
+		window.click(("provider-accounts", 0usize), cx);
+	})
+	.unwrap();
+	wait_until(cx, Duration::from_secs(10), "accounts listed", |cx| {
+		accounts.read_with(cx, |v, _| v.listed_accounts().is_some_and(|a| a.len() == 1))
+	});
+	cx.update_window(handle, |_, window, cx| {
+		window.render_frame(cx);
+		window.click(("account-logout", 0usize), cx);
+		window.render_frame(cx);
+		window.click(("account-confirm", 0usize), cx);
+	})
+	.unwrap();
+	wait_until(cx, Duration::from_secs(10), "logged out", |cx| authenticated(cx).is_empty());
+	let message = accounts.read_with(cx, |v, _| v.message().cloned());
+	assert!(matches!(&message, Some(crate::accounts::Message::Info(t)) if t.contains("已移除")), "{message:?}");
+	let export = std::process::Command::new("omp")
+		.args(["auth", "export"])
+		.env("PI_CODING_AGENT_DIR", &agent)
+		.output()
+		.unwrap();
+	assert!(!String::from_utf8_lossy(&export.stdout).contains("openrouter"), "credential removed from the store");
+	drop(accounts);
+	_ = std::fs::remove_dir_all(&agent);
+}

@@ -4717,6 +4717,7 @@ name = "omp-bridge"
 version = "0.1.0"
 dependencies = [
  "async-channel",
+ "libc",
  "omp-rpc",
  "omp-store",
  "serde",

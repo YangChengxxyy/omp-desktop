@@ -45,6 +45,8 @@ pub struct SessionModel {
 	pub pending:    Option<PendingControl>,
 	/// A compaction (manual or automatic) is running.
 	pub compacting: bool,
+	/// Slash-command catalog from `available_commands_update`.
+	pub commands:   Vec<omp_rpc::AvailableSlashCommand>,
 	/// Every queue state seen, for tests: a steer is delivered within moments,
 	/// so the current queue alone cannot show that it was queued.
 	#[cfg(test)]
@@ -151,6 +153,11 @@ impl SessionModel {
 				}
 			},
 			RpcNotification::ConfigUpdate(_) => effects.refresh_state = true,
+			RpcNotification::AvailableCommandsUpdate(update) => self.commands = update.commands,
+			RpcNotification::CommandOutput(output) => {
+				let index = self.transcript.push_command_output(&output.text);
+				effects.rows = Some((index, self.transcript.entries().len()));
+			},
 			_ => {},
 		}
 		effects
@@ -446,6 +453,18 @@ mod tests {
 		m.load_history(messages[..1].to_vec());
 		assert_eq!(m.row_count(), 1);
 		assert!(m.tools.get("c1").is_none());
+	}
+
+	#[test]
+	fn command_catalog_and_output() {
+		let mut m = SessionModel::default();
+		notify(&mut m, json!({"type":"available_commands_update","commands":[{"name":"model","source":"builtin"}]}));
+		assert_eq!(m.commands.len(), 1);
+		let effects = notify(&mut m, json!({"type":"command_output","text":"Current model: x"}));
+		assert_eq!(effects.rows, Some((0, 1)));
+		let view = m.transcript.entries()[0].view();
+		assert_eq!(view.role, omp_store::display::Role::Command);
+		assert_eq!(view.blocks, [omp_store::display::Block::Output("Current model: x".into())]);
 	}
 
 	#[test]

@@ -49,7 +49,24 @@ pub enum BridgeError {
 	TooOld { found: Version, required: Version },
 	/// The server does not offer protocol v2 (chunked frames).
 	ProtocolUnsupported { supported: Vec<i64> },
+	/// The process exited during startup; `stderr` is the tail it printed.
+	Exited { stderr: String },
 	Rpc(omp_rpc::Error),
+}
+
+impl BridgeError {
+	/// omp quit because no model has usable credentials (a fresh machine
+	/// before `omp login`).
+	pub fn needs_login(&self) -> bool {
+		match self {
+			Self::Exited { stderr } => {
+				["No default model selected", "No models available", "No model available matching"]
+					.iter()
+					.any(|marker| stderr.contains(marker))
+			},
+			_ => false,
+		}
+	}
 }
 
 impl fmt::Display for BridgeError {
@@ -63,6 +80,8 @@ impl fmt::Display for BridgeError {
 			Self::ProtocolUnsupported { supported } => {
 				write!(f, "omp offers RPC protocol versions {supported:?}; omp-desktop needs 2")
 			},
+			Self::Exited { stderr } if stderr.trim().is_empty() => f.write_str("omp exited during startup"),
+			Self::Exited { stderr } => write!(f, "omp exited during startup: {}", stderr.trim()),
 			Self::Rpc(error) => write!(f, "omp rpc: {error}"),
 		}
 	}
@@ -88,11 +107,21 @@ pub struct SessionOptions {
 	pub session_dir: Option<PathBuf>,
 	/// Extra launch flags (`--no-session`, `--thinking off`, …).
 	pub extra_args:  Vec<String>,
+	/// Extra environment for the process (tests point `PI_CODING_AGENT_DIR`
+	/// at a scratch directory).
+	pub env:         Vec<(String, String)>,
 }
 
 impl Default for SessionOptions {
 	fn default() -> Self {
-		Self { omp: PathBuf::from("omp"), cwd: None, resume: None, session_dir: None, extra_args: Vec::new() }
+		Self {
+			omp:         PathBuf::from("omp"),
+			cwd:         None,
+			resume:      None,
+			session_dir: None,
+			extra_args:  Vec::new(),
+			env:         Vec::new(),
+		}
 	}
 }
 
@@ -142,7 +171,13 @@ impl Session {
 		let version = check_version(&options.omp)?;
 		let mut process = Process::new(&options.omp);
 		process.args(options.args());
-		let (client, receiver) = Client::spawn(process, ClientOptions::default())?;
+		process.envs(options.env.iter().map(|(k, v)| (k, v)));
+		let stderr = capture_stderr(&mut process).map_err(|error| BridgeError::Rpc(omp_rpc::Error::Io(error)))?;
+		let (client, receiver) = match Client::spawn(process, ClientOptions::default()) {
+			Ok(connected) => connected,
+			Err(omp_rpc::Error::Closed) => return Err(BridgeError::Exited { stderr: stderr.wait_tail() }),
+			Err(error) => return Err(error.into()),
+		};
 		let supported = client.ready().supported_protocol_versions.clone().unwrap_or_default();
 		if client.protocol_version() != 2 {
 			return Err(BridgeError::ProtocolUnsupported { supported });
@@ -169,6 +204,85 @@ impl Session {
 
 		Ok(Self { client: Arc::new(client), events, version, delta })
 	}
+}
+
+/// Sends SIGTERM to the process group of a session spawned by
+/// [`Session::spawn`] (it leads its own group). Use it when a blocking call
+/// holds the client and the process must stop now: the call then returns
+/// `Closed`, and dropping the last client handle reaps the process.
+pub fn terminate_group(pid: u32) {
+	#[cfg(unix)]
+	if let Ok(pgid) = libc::pid_t::try_from(pid) {
+		// SAFETY: `kill` has no memory-safety preconditions; ESRCH (already
+		// gone) is fine.
+		unsafe { libc::kill(-pgid, libc::SIGTERM) };
+	}
+	#[cfg(not(unix))]
+	let _ = pid;
+}
+
+/// The last bytes omp wrote to stderr. A thread drains the pipe (so omp
+/// never blocks on it) and copies everything to this process's stderr.
+struct StderrTail {
+	tail:   Arc<std::sync::Mutex<Vec<u8>>>,
+	reader: thread::JoinHandle<()>,
+}
+
+const STDERR_TAIL_BYTES: usize = 8 * 1024;
+
+impl StderrTail {
+	/// Waits for the pipe to close (the process exited) up to a second and
+	/// returns the tail without ANSI colour codes.
+	fn wait_tail(self) -> String {
+		let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+		while !self.reader.is_finished() && std::time::Instant::now() < deadline {
+			thread::sleep(std::time::Duration::from_millis(10));
+		}
+		let bytes = self.tail.lock().map(|t| t.clone()).unwrap_or_default();
+		strip_ansi(&String::from_utf8_lossy(&bytes))
+	}
+}
+
+fn capture_stderr(process: &mut Process) -> std::io::Result<StderrTail> {
+	use std::io::{Read as _, Write as _};
+	let (mut reader, writer) = std::io::pipe()?;
+	process.stderr(writer);
+	let tail = Arc::new(std::sync::Mutex::new(Vec::new()));
+	let sink = tail.clone();
+	let reader = thread::Builder::new().name("omp-stderr".into()).spawn(move || {
+		let mut buffer = [0u8; 4096];
+		while let Ok(read) = reader.read(&mut buffer) {
+			if read == 0 {
+				break;
+			}
+			_ = std::io::stderr().write_all(&buffer[..read]);
+			if let Ok(mut tail) = sink.lock() {
+				tail.extend_from_slice(&buffer[..read]);
+				let excess = tail.len().saturating_sub(STDERR_TAIL_BYTES);
+				tail.drain(..excess);
+			}
+		}
+	})?;
+	Ok(StderrTail { tail, reader })
+}
+
+fn strip_ansi(text: &str) -> String {
+	let mut out = String::with_capacity(text.len());
+	let mut chars = text.chars().peekable();
+	while let Some(c) = chars.next() {
+		if c == '\u{1b}' && chars.peek() == Some(&'[') {
+			chars.next();
+			// CSI: parameters, then one final byte in @..~.
+			for c in chars.by_ref() {
+				if ('@'..='~').contains(&c) {
+					break;
+				}
+			}
+		} else {
+			out.push(c);
+		}
+	}
+	out
 }
 
 /// `set_event_filter` with `messageUpdates`, which the generated
@@ -201,5 +315,31 @@ mod tests {
 		assert_eq!(Version::parse_omp_version("garbage"), None);
 		assert!(Version(18, 13, 2) < MIN_OMP_VERSION);
 		assert!(Version(18, 14, 0) > MIN_OMP_VERSION);
+	}
+
+	#[test]
+	fn startup_exit_reports_missing_credentials() {
+		assert_eq!(strip_ansi("\u{1b}[31mNo models\u{1b}[39m."), "No models.");
+		let stderr = "\u{1b}[31mNo default model selected. Use /login\u{1b}[39m\n".to_owned();
+		let error = BridgeError::Exited { stderr: strip_ansi(&stderr) };
+		assert!(error.needs_login());
+		assert!(!BridgeError::Exited { stderr: "boom".into() }.needs_login());
+	}
+
+	/// A process that exits before `ready` yields its stderr.
+	#[test]
+	fn exited_process_returns_stderr_tail() {
+		let options = SessionOptions {
+			omp: PathBuf::from("/bin/sh"),
+			..Default::default()
+		};
+		let mut process = Process::new(&options.omp);
+		process.args(["-c", "echo 'No default model selected.' >&2; exit 1"]);
+		let stderr = capture_stderr(&mut process).unwrap();
+		let error = match Client::spawn(process, ClientOptions::default()) {
+			Err(omp_rpc::Error::Closed) => BridgeError::Exited { stderr: stderr.wait_tail() },
+			other => panic!("unexpected {:?}", other.map(|_| ())),
+		};
+		assert!(error.needs_login(), "{error}");
 	}
 }

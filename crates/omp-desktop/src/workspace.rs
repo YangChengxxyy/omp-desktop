@@ -2,7 +2,7 @@
 //! sidebar listing saved sessions grouped by working directory.
 //!
 //! Shortcuts: ⌘N new tab · ⌘W close tab · ⌘1–9 switch tab · ⌘P search
-//! sessions · ⌘B toggle the sidebar.
+//! sessions · ⌘B toggle the sidebar · ⌘⇧L accounts.
 
 use std::{
 	collections::HashSet,
@@ -19,7 +19,8 @@ use gpui_kit::*;
 use omp_bridge::SessionOptions;
 use omp_store::sessions::{self, Scan, SessionInfo};
 
-use crate::chat::{ChatView, TabStatus, TabSummary};
+use crate::accounts::{AccountsEvent, AccountsView};
+use crate::chat::{ChatEvent, ChatView, TabStatus, TabSummary};
 use crate::theme;
 
 /// The session directory has no change notification we rely on; a scan reads
@@ -41,6 +42,8 @@ pub struct Workspace {
 	sidebar:     bool,
 	/// Sidebar groups the user folded, by cwd.
 	collapsed:   HashSet<PathBuf>,
+	/// The accounts modal, while open; it runs its own omp process.
+	accounts:    Option<(Entity<AccountsView>, Subscription)>,
 	_tasks:      Vec<Task<()>>,
 	_subs:       Vec<Subscription>,
 }
@@ -50,7 +53,7 @@ struct Tab {
 	/// Last summary seen, so streaming updates that change nothing visible in
 	/// the tab bar do not re-render the workspace.
 	summary: TabSummary,
-	_sub:    Subscription,
+	_subs:   [Subscription; 2],
 }
 
 impl Workspace {
@@ -72,6 +75,7 @@ impl Workspace {
 			search,
 			sidebar: true,
 			collapsed: HashSet::new(),
+			accounts: None,
 			_tasks: Vec::new(),
 			_subs: vec![sub],
 		};
@@ -106,10 +110,13 @@ impl Workspace {
 		.detach();
 	}
 
-	fn push_tab(&mut self, view: Entity<ChatView>, cx: &mut Context<Self>) {
+	fn push_tab(&mut self, view: Entity<ChatView>, window: &mut Window, cx: &mut Context<Self>) {
 		let summary = view.read(cx).summary();
-		let sub = cx.observe(&view, |this, view, cx| this.tab_changed(&view, cx));
-		self.tabs.push(Tab { view, summary, _sub: sub });
+		let observe = cx.observe(&view, |this, view, cx| this.tab_changed(&view, cx));
+		let events = cx.subscribe_in(&view, window, |this, _, event: &ChatEvent, window, cx| match event {
+			ChatEvent::OpenAccounts => this.open_accounts(window, cx),
+		});
+		self.tabs.push(Tab { view, summary, _subs: [observe, events] });
 		self.active = self.tabs.len() - 1;
 		cx.notify();
 	}
@@ -117,7 +124,7 @@ impl Workspace {
 	pub fn new_tab(&mut self, cwd: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
 		let options = SessionOptions { cwd: Some(cwd), ..self.base.clone() };
 		let view = cx.new(|cx| ChatView::new(options, window, cx));
-		self.push_tab(view, cx);
+		self.push_tab(view, window, cx);
 	}
 
 	/// Opens a saved session: switches to its tab when one already has it,
@@ -131,7 +138,7 @@ impl Workspace {
 		let view = cx.new(|cx| {
 			if fork { ChatView::fork(options, window, cx) } else { ChatView::new(options, window, cx) }
 		});
-		self.push_tab(view, cx);
+		self.push_tab(view, window, cx);
 	}
 
 	fn tab_with_file(&self, path: &Path) -> Option<usize> {
@@ -183,6 +190,39 @@ impl Workspace {
 		cx.notify();
 	}
 
+	pub fn open_accounts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+		if self.accounts.is_some() {
+			return;
+		}
+		let view = cx.new(|cx| AccountsView::new(&self.base, window, cx));
+		let sub = cx.subscribe_in(&view, window, |this, _, event: &AccountsEvent, window, cx| match event {
+			AccountsEvent::Close => this.close_accounts(window, cx),
+			// Tabs that could not start for lack of credentials can now.
+			AccountsEvent::Changed => {
+				for tab in &this.tabs {
+					tab.view.update(cx, |view, cx| view.reconnect_if_failed(cx));
+				}
+			},
+		});
+		self.accounts = Some((view, sub));
+		cx.notify();
+	}
+
+	fn close_accounts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+		// Dropping the view stops its omp process.
+		if self.accounts.take().is_some()
+			&& let Some(view) = self.tabs.get(self.active).map(|tab| tab.view.clone())
+		{
+			view.update(cx, |view, cx| view.focus_composer(window, cx));
+		}
+		cx.notify();
+	}
+
+	#[cfg(test)]
+	pub(crate) fn accounts_view(&self) -> Option<Entity<AccountsView>> {
+		self.accounts.as_ref().map(|(view, _)| view.clone())
+	}
+
 	fn focus_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
 		self.sidebar = true;
 		self.search.update(cx, |state, cx| state.focus(window, cx));
@@ -193,7 +233,19 @@ impl Workspace {
 	fn on_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
 		let keystroke = &event.keystroke;
 		let modifiers = &keystroke.modifiers;
-		if !modifiers.secondary(cx) || modifiers.shift || modifiers.alt {
+		if keystroke.key == "escape" && self.accounts.is_some() {
+			self.close_accounts(window, cx);
+			cx.stop_propagation();
+			return;
+		}
+		if !modifiers.secondary(cx) || modifiers.alt {
+			return;
+		}
+		if modifiers.shift {
+			if keystroke.key == "l" {
+				self.open_accounts(window, cx);
+				cx.stop_propagation();
+			}
 			return;
 		}
 		match keystroke.key.as_str() {
@@ -309,7 +361,14 @@ impl Workspace {
 					)),
 			)
 			.child(
-				div().pr_2().child(
+				div().pr_2().flex().gap_1().child(
+					Button::new("accounts-open")
+						.ghost()
+						.xsmall()
+						.label("账号")
+						.tooltip("登录 / 退出 provider（⌘⇧L）")
+						.on_click(cx.listener(|this, _, window, cx| this.open_accounts(window, cx))),
+				).child(
 					Button::new("sidebar-toggle")
 						.ghost()
 						.xsmall()
@@ -531,6 +590,19 @@ impl Render for Workspace {
 					.when(self.sidebar, |row| row.child(self.render_sidebar(cx)))
 					.child(div().flex_1().min_w_0().h_full().relative().children(active)),
 			)
+			.when_some(self.accounts.as_ref().map(|(view, _)| view.clone()), |root, view| {
+				root.child(
+					div()
+						.id("accounts-overlay")
+						.absolute()
+						.inset_0()
+						.flex()
+						.items_center()
+						.justify_center()
+						.bg(hsla(0., 0., 0., 0.35))
+						.child(view),
+				)
+			})
 	}
 }
 

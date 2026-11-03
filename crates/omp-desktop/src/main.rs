@@ -2,10 +2,13 @@
 //! session in the launch directory (or `--cwd <dir>`). `--session-dir <dir>`
 //! stores and lists sessions there instead of `~/.omp/agent/sessions`.
 
-mod chat;
+mod accounts;
 mod attachments;
+mod chat;
 mod dialog;
+mod login;
 mod session;
+mod slash;
 mod status;
 mod theme;
 mod tool_card;
