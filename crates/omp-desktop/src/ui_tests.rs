@@ -730,3 +730,153 @@ async fn subagent_panel_steers_and_cancels(cx: &mut TestAppContext) {
 	wait_until(cx, Duration::from_secs(120), "run settles", |cx| view.read_with(cx, |v, _| v.is_idle()));
 	_ = std::fs::remove_dir_all(&dir);
 }
+
+/// A solid-colour PNG, built by hand so the test needs no image crate.
+fn solid_png(width: u32, height: u32, rgb: [u8; 3]) -> Vec<u8> {
+	fn crc32(bytes: &[u8]) -> u32 {
+		let mut crc = !0u32;
+		for &b in bytes {
+			crc ^= b as u32;
+			for _ in 0..8 {
+				crc = if crc & 1 != 0 { (crc >> 1) ^ 0xEDB8_8320 } else { crc >> 1 };
+			}
+		}
+		!crc
+	}
+	fn adler32(bytes: &[u8]) -> u32 {
+		let (mut a, mut b) = (1u32, 0u32);
+		for &x in bytes {
+			a = (a + x as u32) % 65521;
+			b = (b + a) % 65521;
+		}
+		b << 16 | a
+	}
+	fn chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+		out.extend((data.len() as u32).to_be_bytes());
+		let start = out.len();
+		out.extend(kind);
+		out.extend(data);
+		let crc = crc32(&out[start..]);
+		out.extend(crc.to_be_bytes());
+	}
+	let mut raw = Vec::new();
+	for _ in 0..height {
+		raw.push(0);
+		for _ in 0..width {
+			raw.extend(rgb);
+		}
+	}
+	// zlib with stored (uncompressed) deflate blocks.
+	let mut zlib = vec![0x78, 0x01];
+	let blocks: Vec<_> = raw.chunks(65_535).collect();
+	for (i, block) in blocks.iter().enumerate() {
+		zlib.push(u8::from(i + 1 == blocks.len()));
+		let len = block.len() as u16;
+		zlib.extend(len.to_le_bytes());
+		zlib.extend((!len).to_le_bytes());
+		zlib.extend(*block);
+	}
+	zlib.extend(adler32(&raw).to_be_bytes());
+	let mut ihdr = Vec::new();
+	ihdr.extend(width.to_be_bytes());
+	ihdr.extend(height.to_be_bytes());
+	ihdr.extend([8, 2, 0, 0, 0]);
+	let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+	chunk(&mut png, b"IHDR", &ihdr);
+	chunk(&mut png, b"IDAT", &zlib);
+	chunk(&mut png, b"IEND", &[]);
+	png
+}
+
+/// ⌘V with an image on the clipboard attaches it (text paste still types),
+/// × removes it, and the sent prompt carries the image to the model, which
+/// can see it. The transcript then shows the image, not a placeholder.
+#[gpui_kit::test]
+#[ignore = "spawns omp and calls a model"]
+async fn pasted_image_reaches_the_model(cx: &mut TestAppContext) {
+	use gpui_kit::{ClipboardItem, Image, ImageFormat};
+	let (handle, view, dir) = open_chat(cx, "image", &["--no-tools"]);
+	let paste = |cx: &mut TestAppContext, item: ClipboardItem| {
+		cx.write_to_clipboard(item);
+		cx.update_window(handle, |_, window, cx| {
+			window.render_frame(cx);
+			window.click("composer", cx);
+			window.press("cmd-v", cx);
+			window.render_frame(cx);
+		})
+		.unwrap();
+	};
+
+	paste(cx, ClipboardItem::new_string("颜色？".into()));
+	assert_eq!(view.read_with(cx, |v, cx| v.composer_text(cx)), "颜色？", "text paste still types");
+
+	let red = Image::from_bytes(ImageFormat::Png, solid_png(64, 64, [255, 0, 0]));
+	paste(cx, ClipboardItem::new_image(&red));
+	paste(cx, ClipboardItem::new_image(&red));
+	assert_eq!(view.read_with(cx, |v, _| v.attachment_labels()), ["图片.png"], "same image attaches once");
+	assert_eq!(view.read_with(cx, |v, cx| v.composer_text(cx)), "颜色？", "image paste adds no text");
+
+	let blue = Image::from_bytes(ImageFormat::Png, solid_png(64, 64, [0, 0, 255]));
+	paste(cx, ClipboardItem::new_image(&blue));
+	assert_eq!(view.read_with(cx, |v, _| v.attachment_labels().len()), 2);
+	cx.update_window(handle, |_, window, cx| window.click(("attachment-remove", 1usize), cx)).unwrap();
+	assert_eq!(view.read_with(cx, |v, _| v.attachment_labels().len()), 1, "× removes the blue one");
+
+	cx.update_window(handle, |_, window, cx| {
+		window.input("只用一个中文词回答这张图片的颜色", cx);
+		window.press("enter", cx);
+	})
+	.unwrap();
+	assert!(view.read_with(cx, |v, _| v.attachment_labels().is_empty()), "attachments clear on send");
+	wait_until(cx, Duration::from_secs(120), "reply settles", |cx| {
+		view.read_with(cx, |v, _| v.is_idle() && v.assistant_text().is_some())
+	});
+	let reply = view.read_with(cx, |v, _| v.assistant_text()).unwrap();
+	assert!(reply.contains('红'), "model did not see the red image: {reply:?}");
+	let (row, user) = view.read_with(cx, |v, _| {
+		v.rows().into_iter().enumerate().find(|(_, r)| r.role == Role::User).map(|(i, r)| (i, r.blocks)).unwrap()
+	});
+	let block = user
+		.iter()
+		.position(|b| matches!(b, Block::Image { data, .. } if !data.is_empty()))
+		.unwrap_or_else(|| panic!("user message has no image: {user:?}"));
+	cx.update_window(handle, |_, window, cx| {
+		window.render_frame(cx);
+		assert!(window.try_find(("transcript-image", row * 64 + block)).is_some(), "transcript shows no image");
+	})
+	.unwrap();
+	_ = std::fs::remove_dir_all(&dir);
+}
+
+/// Image files dropped on the tab attach; other files are reported, not sent.
+#[gpui_kit::test]
+#[ignore = "spawns omp"]
+async fn dropped_image_files_attach(cx: &mut TestAppContext) {
+	use gpui_kit::{ExternalPaths, FileDropEvent, PlatformInput};
+	let (handle, view, dir) = open_chat(cx, "drop", &["--no-tools"]);
+	let png = dir.join("红色.png");
+	std::fs::write(&png, solid_png(8, 8, [255, 0, 0])).unwrap();
+	let txt = dir.join("notes.txt");
+	std::fs::write(&txt, "hi").unwrap();
+	let position = Point::new(px(400.), px(300.));
+	cx.update_window(handle, |_, window, cx| {
+		window.render_frame(cx);
+		let paths = ExternalPaths(vec![png.clone(), txt.clone()].into());
+		for event in [
+			FileDropEvent::Entered { position, paths },
+			FileDropEvent::Pending { position },
+			FileDropEvent::Submit { position },
+		] {
+			window.dispatch_event(PlatformInput::FileDrop(event), cx);
+		}
+		window.render_frame(cx);
+	})
+	.unwrap();
+	assert_eq!(view.read_with(cx, |v, _| v.attachment_labels()), ["红色.png"]);
+	assert!(
+		view.read_with(cx, |v, _| v.notices().iter().any(|n| matches!(n, Notice::Info(t) if t.contains("notes.txt")))),
+		"non-image file not reported"
+	);
+	cx.update_window(handle, |_, window, _| assert!(window.try_find(("attachment", 0usize)).is_some())).unwrap();
+	_ = std::fs::remove_dir_all(&dir);
+}

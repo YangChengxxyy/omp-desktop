@@ -4,7 +4,7 @@
 use std::{path::PathBuf, sync::Arc};
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
+use gpui_kit::component::input::{Input, InputEvent, InputState, Paste, Textarea, TextareaState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::progress::Progress;
 use gpui_kit::component::switch::Switch;
@@ -23,6 +23,7 @@ use omp_rpc::{
 };
 use omp_store::display::{Block, Role, View};
 
+use crate::attachments;
 use crate::dialog::{self, DialogEvent, DialogView};
 use crate::session::{Activity, Notice, PendingControl, SessionModel};
 use crate::status;
@@ -90,6 +91,10 @@ pub struct ChatView {
 	list:         ListState,
 	composer:     Entity<TextareaState>,
 	dialog:       Option<Entity<DialogView>>,
+	/// Images waiting in the composer, sent with the next message.
+	attachments:  Vec<attachments::Attachment>,
+	/// Decoded transcript images by (row, block); cleared with the list.
+	images:       std::cell::RefCell<std::collections::HashMap<(usize, usize), Option<Arc<Image>>>>,
 	/// Thinking blocks the user expanded, by (row, block).
 	expanded:     std::collections::HashSet<(usize, usize)>,
 	/// Abort requests sent, for tests that check one key press aborts once.
@@ -114,7 +119,7 @@ impl ChatView {
 		let cwd = options.cwd.clone().unwrap_or_else(|| PathBuf::from("."));
 		let composer = cx.new(|cx| {
 			TextareaState::new(window, cx)
-				.placeholder("给 omp 发消息…（Enter 发送，Shift+Enter 换行；运行中 Enter 排队，⌘Enter 插队）")
+				.placeholder("给 omp 发消息…（Enter 发送，Shift+Enter 换行；运行中 Enter 排队，⌘Enter 插队；⌘V 或拖入可附加图片）")
 				.auto_grow(2, 10)
 				.submit_on_enter(true)
 		});
@@ -142,6 +147,8 @@ impl ChatView {
 			list,
 			composer,
 			dialog: None,
+			attachments: Vec::new(),
+			images: Default::default(),
 			expanded: Default::default(),
 			#[cfg(test)]
 			aborts: 0,
@@ -188,6 +195,7 @@ impl ChatView {
 			_ = this.update(cx, |this, cx| {
 				if !history.is_empty() {
 					this.model.load_history(history);
+					this.images.borrow_mut().clear();
 					this.list.reset(this.model.row_count());
 				}
 				this.model.notices.extend(notice);
@@ -223,6 +231,7 @@ impl ChatView {
 		self.fork = false;
 		self.model = SessionModel::default();
 		self.dialog = None;
+		self.images.borrow_mut().clear();
 		self.list.reset(0);
 		self.connect(cx);
 		cx.notify();
@@ -308,6 +317,11 @@ impl ChatView {
 	#[cfg(test)]
 	pub(crate) fn transcript(&self) -> &omp_store::Transcript {
 		&self.model.transcript
+	}
+
+	#[cfg(test)]
+	pub(crate) fn attachment_labels(&self) -> Vec<String> {
+		self.attachments.iter().map(attachments::Attachment::label).collect()
 	}
 
 	#[cfg(test)]
@@ -466,9 +480,11 @@ impl ChatView {
 		let Some(client) = self.client() else {
 			return;
 		};
-		if text.is_empty() {
+		if text.is_empty() && self.attachments.is_empty() {
 			return;
 		}
+		let images = std::mem::take(&mut self.attachments);
+		let wire = (!images.is_empty()).then(|| images.iter().map(attachments::Attachment::to_wire).collect::<Vec<_>>());
 		// While the agent works, a message queues: as a follow-up for the next
 		// turn, or as a steer injected at the next tool boundary.
 		let streaming_behavior = self.model.busy().then_some(match delivery {
@@ -478,19 +494,92 @@ impl ChatView {
 		self.composer.update(cx, |state, cx| state.clean(window, cx));
 		self.model.prompt_sent();
 		let call = cx.background_spawn(async move {
-			client.call(&PromptCommand { message: text, images: None, streaming_behavior })
+			client.call(&PromptCommand { message: text, images: wire, streaming_behavior })
 		});
 		cx.spawn(async move |this, cx| {
 			if let Err(error) = call.await {
 				_ = this.update(cx, |this, cx| {
 					this.model.notices.push(Notice::Error(format!("发送失败：{error}")));
 					this.model.activity = Default::default();
+					// Keep the images so the user can resend.
+					if this.attachments.is_empty() {
+						this.attachments = images;
+					}
 					cx.notify();
 				});
 			}
 		})
 		.detach();
 		cx.notify();
+	}
+
+	/// Adds pasted or dropped images to the composer; reports what was
+	/// skipped. Returns whether the paste carried anything besides text.
+	fn attach(&mut self, pasted: attachments::Pasted, cx: &mut Context<Self>) -> bool {
+		if pasted.is_empty() {
+			return false;
+		}
+		if !pasted.rejected.is_empty() {
+			self.model.notices.push(Notice::Info(format!("未附加：{}", pasted.rejected.join("、"))));
+		}
+		for image in pasted.images {
+			// The same bitmap pasted twice attaches once.
+			if !self.attachments.iter().any(|a| a.image.id == image.image.id) {
+				self.attachments.push(image);
+			}
+		}
+		cx.notify();
+		true
+	}
+
+	fn remove_attachment(&mut self, index: usize, cx: &mut Context<Self>) {
+		if index < self.attachments.len() {
+			self.attachments.remove(index);
+		}
+		cx.notify();
+	}
+
+	fn render_attachments(&self, cx: &mut Context<Self>) -> impl IntoElement {
+		let p = theme::palette(cx);
+		div().flex().flex_wrap().gap_2().children(self.attachments.iter().enumerate().map(|(index, attachment)| {
+			div()
+				.id(("attachment", index))
+				.relative()
+				.flex()
+				.flex_col()
+				.items_center()
+				.gap_0p5()
+				.p_1()
+				.rounded(px(6.))
+				.border_1()
+				.border_color(rgb(p.border))
+				.bg(rgb(p.elevated))
+				.child(
+					img(attachment.image.clone())
+						.size(px(56.))
+						.object_fit(ObjectFit::Cover)
+						.rounded(px(4.)),
+				)
+				.child(
+					div()
+						.max_w(px(64.))
+						.truncate()
+						.text_xs()
+						.text_color(rgb(p.muted_foreground))
+						.child(attachment.label()),
+				)
+				.child(
+					div().absolute().top_0().right_0().child(
+						Button::new(("attachment-remove", index))
+							.ghost()
+							.xsmall()
+							.label("×")
+							.tooltip("移除")
+							.on_click(cx.listener(move |this, _, _, cx| this.remove_attachment(index, cx))),
+					),
+				)
+				.test_support()
+		}))
 	}
 
 	fn abort(&mut self, cx: &mut Context<Self>) {
@@ -732,11 +821,12 @@ impl ChatView {
 						.rounded(px(8.))
 						.bg(rgb(p.accent))
 						.text_sm()
-						.children(view.blocks.iter().map(|block| match block {
+						.flex()
+						.flex_col()
+						.gap_2()
+						.children(view.blocks.iter().enumerate().map(|(bi, block)| match block {
 							Block::Text(text) => div().child(text.clone()).into_any_element(),
-							Block::Image { mime_type } => {
-								div().text_xs().child(format!("[图片 {mime_type}]")).into_any_element()
-							},
+							Block::Image { mime_type, data } => self.render_image(index, bi, mime_type, data, cx),
 							_ => div().into_any_element(),
 						})),
 				)
@@ -789,6 +879,28 @@ impl ChatView {
 							}),
 					)
 					.into_any_element()
+			},
+		}
+	}
+
+	/// A transcript image, decoded once per (row, block); a label when the
+	/// message carried no data or an unknown format.
+	fn render_image(&self, row: usize, bi: usize, mime_type: &str, data: &str, cx: &App) -> AnyElement {
+		let p = theme::palette(cx);
+		let image = self
+			.images
+			.borrow_mut()
+			.entry((row, bi))
+			.or_insert_with(|| attachments::decode(mime_type, data))
+			.clone();
+		match image {
+			Some(image) => div()
+				.id(("transcript-image", row * 64 + bi))
+				.child(img(image).max_w(px(320.)).max_h(px(240.)).object_fit(ObjectFit::Contain).rounded(px(6.)))
+				.test_support()
+				.into_any_element(),
+			None => {
+				div().text_xs().text_color(rgb(p.muted_foreground)).child(format!("[图片 {mime_type}]")).into_any_element()
 			},
 		}
 	}
@@ -853,9 +965,7 @@ impl ChatView {
 					cx.notify();
 				}))
 			},
-			Block::Image { mime_type } => {
-				div().text_xs().text_color(rgb(p.muted_foreground)).child(format!("[图片 {mime_type}]")).into_any_element()
-			},
+			Block::Image { mime_type, data } => self.render_image(row, bi, mime_type, data, cx),
 			Block::Output(text) => div().font_family("Menlo").text_xs().child(text.clone()).into_any_element(),
 		}
 	}
@@ -1276,6 +1386,7 @@ impl ChatView {
 			.flex_col()
 			.gap_2()
 			.child(div().flex().flex_wrap().gap_1().children(chips))
+			.when(!self.attachments.is_empty(), |col| col.child(self.render_attachments(cx)))
 			.child(
 				div()
 					.flex()
@@ -1287,6 +1398,14 @@ impl ChatView {
 							.capture_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
 								if event.keystroke.key == "escape" {
 									this.on_escape(cx);
+								}
+							}))
+							// Images on the clipboard attach; text pastes as usual.
+							.capture_action(cx.listener(|this, _: &Paste, _, cx| {
+								if let Some(item) = cx.read_from_clipboard()
+									&& this.attach(attachments::from_clipboard(&item), cx)
+								{
+									cx.stop_propagation();
 								}
 							}))
 							.child(div().id("composer").child(Textarea::new(&self.composer).w_full()).test_support()),
@@ -1415,11 +1534,17 @@ impl Render for ChatView {
 		};
 
 		div()
+			.id("chat-root")
 			.size_full()
 			.relative()
 			.flex()
 			.flex_col()
 			.bg(rgb(p.background))
+			// Image files dropped anywhere on the tab attach to the composer.
+			.drag_over::<ExternalPaths>(move |style, _, _, _| style.bg(rgb(p.accent)))
+			.on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
+				this.attach(attachments::from_paths(paths.paths()), cx);
+			}))
 			.text_color(cx.theme().foreground)
 			.when_some(disconnected_banner, |root, error| {
 				root.child(

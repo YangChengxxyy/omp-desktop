@@ -25,7 +25,9 @@ pub enum Block {
 	/// `arguments` is the parsed object once `toolcall_end` arrived, else the
 	/// raw JSON fragment streamed so far.
 	ToolCall { id: String, name: String, arguments: ToolArgs, intent: Option<String> },
-	Image { mime_type: String },
+	/// `data` is the base64 payload; empty when the message carried only a
+	/// URL or provider file reference.
+	Image { mime_type: String, data: String },
 	/// Plain text output (tool results).
 	Output(String),
 }
@@ -77,9 +79,7 @@ impl Entry {
 							},
 							intent:    call.intent.clone(),
 						},
-						AssistantContent::Image(image) => Block::Image {
-							mime_type: image.mime_type.clone().unwrap_or_default(),
-						},
+						AssistantContent::Image(image) => image_block(image),
 						_ => continue,
 					};
 					view.blocks.push(block);
@@ -105,8 +105,12 @@ impl Entry {
 fn user_block(part: &UserContent) -> Block {
 	match part {
 		UserContent::Text(t) => Block::Text(t.text.clone().unwrap_or_default()),
-		UserContent::Image(image) => Block::Image { mime_type: image.mime_type.clone().unwrap_or_default() },
+		UserContent::Image(image) => image_block(image),
 	}
+}
+
+fn image_block(image: &omp_rpc::ImageContent) -> Block {
+	Block::Image { mime_type: image.mime_type.clone().unwrap_or_default(), data: image.data.clone().unwrap_or_default() }
 }
 
 #[cfg(test)]

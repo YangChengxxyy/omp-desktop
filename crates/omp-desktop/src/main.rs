@@ -3,6 +3,7 @@
 //! stores and lists sessions there instead of `~/.omp/agent/sessions`.
 
 mod chat;
+mod attachments;
 mod dialog;
 mod session;
 mod status;
