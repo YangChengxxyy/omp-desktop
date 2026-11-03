@@ -1,0 +1,47 @@
+crates/omp-desktop/tests/fixtures/dialogs.ts
+  s_b2342d065cdbe9::t_4b33b9827a9b5b 1-14
+README.md
+  s_b2342d065cdbe9::t_40efdb93d5de33 15,18-19,28-29,31,39,49,52
+crates/omp-desktop/src/dialog.rs
+  s_b2342d065cdbe9::t_1020b3f87c533a 81-93,209,213
+crates/omp-desktop/src/ui_tests.rs
+  s_b2342d065cdbe9::t_d6482310c7a503 447-448,482-486
+  s_b2342d065cdbe9::t_df7ddeac522b3b 244,246-247,260-262,264-267,269-271,278-280,282-283,287,289-292
+  s_b2342d065cdbe9::t_11ee97c0a039d8 360
+  s_b2342d065cdbe9::t_c9114fc7c30031 15-16,18-19,242-243,245,248-259,263,268,272-277,281,284-286,288,293-359,361-446,449-481,487-488,572-587
+crates/omp-desktop/src/session.rs
+  s_b2342d065cdbe9::t_d1249c2c69875a 39-42,118-119
+  s_b2342d065cdbe9::t_f74618fe78b46e 293-311
+crates/omp-store/src/sessions.rs
+  s_b2342d065cdbe9::t_b9f18e8b620dc3 89-91,133-144,273-285
+  s_b2342d065cdbe9::t_ad720ecbda33d0 1-78,81,83-88,92-132,145-272,286-316
+  s_b2342d065cdbe9::t_d1249c2c69875a 79-80,82
+crates/omp-store/src/lib.rs
+  s_b2342d065cdbe9::t_8643ea38147dcf 15
+crates/omp-desktop/src/main.rs
+  s_b2342d065cdbe9::t_a09ba34a89916d 1-3,10,14,18-19,23,26-27,29-33,38-56
+crates/omp-desktop/src/workspace.rs
+  s_b2342d065cdbe9::t_943c4ae5070f74 1-539
+crates/omp-store/examples/sessions.rs
+  s_b2342d065cdbe9::t_5057689aa49f9d 1-17
+docs/tech-plan.md
+  s_b2342d065cdbe9::t_40efdb93d5de33 114-117,147-148
+crates/omp-desktop/src/chat.rs
+  s_b2342d065cdbe9::t_d1249c2c69875a 117,119,139-155,157-158,170-174,197-240,253-282,351-355
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.51-trip",
+  "base_commit_sha": "f634d01235d3be767e3ffa40231b3152d3c6e99e",
+  "prompts": {},
+  "sessions": {
+    "s_b2342d065cdbe9": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "01a19f52-04d9-71a8-a90f-e3cc9ae0ded3",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "YangChengxxyy <yangc27@trip.com>"
+    }
+  }
+}
