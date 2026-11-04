@@ -83,22 +83,43 @@ impl Render for PaletteView {
 			.into_iter()
 			.enumerate()
 			.map(|(index, entry)| {
+				let primary = entry.subtitle.as_ref().unwrap_or(&entry.title).clone();
+				let secondary = entry.subtitle.as_ref().map(|_| entry.title.clone());
 				div()
 					.id(("palette-row", index))
 					.flex()
 					.items_center()
 					.gap_2()
 					.px_3()
-					.h(px(32.))
+					.h(px(34.))
 					.rounded(px(6.))
 					.text_sm()
 					.cursor_pointer()
 					.when(index == selected, |r| r.bg(rgb(p.accent)).text_color(rgb(p.accent_foreground)))
 					.when(index != selected, |r| r.hover(|s| s.bg(rgb(p.muted))))
 					.child(div().w(px(36.)).flex_none().text_xs().text_color(rgb(p.muted_foreground)).child(entry.group.label()))
-					.child(div().flex_none().max_w(px(320.)).truncate().child(entry.title.clone()))
+					.child(div().flex_none().max_w(px(240.)).truncate().font_weight(FontWeight::MEDIUM).child(primary))
+					.when_some(secondary.clone(), |r, id| {
+						r.child(div().flex_1().min_w_0().truncate().text_xs().text_color(rgb(p.muted_foreground)).child(id))
+					})
+					.when(secondary.is_none() && entry.provider.is_some(), |r| r.child(div().flex_1()))
 					.when(entry.current, |r| r.child(div().flex_none().text_xs().text_color(rgb(p.success)).child("当前")))
-					.child(div().flex_1().min_w_0().truncate().text_xs().text_color(rgb(p.muted_foreground)).child(entry.detail.clone()))
+					.when(entry.provider.is_none(), |r| {
+						r.child(div().flex_1().min_w_0().truncate().text_xs().text_color(rgb(p.muted_foreground)).child(entry.detail.clone()))
+					})
+					.when_some(entry.provider.clone(), |r, provider| {
+						r.child(
+							div()
+								.flex_none()
+								.px_1p5()
+								.py_0p5()
+								.rounded(px(4.))
+								.bg(rgb(p.muted))
+								.text_xs()
+								.text_color(rgb(p.muted_foreground))
+								.child(provider),
+						)
+					})
 					.when_some(entry.shortcut, |r, keys| {
 						r.child(div().flex_none().text_xs().font_family("Menlo").text_color(rgb(p.muted_foreground)).child(keys))
 					})

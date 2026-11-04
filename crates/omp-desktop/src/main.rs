@@ -5,6 +5,7 @@
 mod accounts;
 mod attachments;
 mod chat;
+mod copy;
 mod dialog;
 mod launch_env;
 mod login;
@@ -31,9 +32,10 @@ fn main() {
 		session_dir: args.session_dir,
 		..Default::default()
 	};
-	gpui_kit::application().run(move |cx| {
+	gpui_kit::application().with_assets(gpui_kit::assets::Assets).run(move |cx| {
 		gpui_kit::init(cx);
 		theme::apply(cx);
+		workspace::init_menus(cx);
 		let bounds = Bounds::centered(None, size(px(1280.), px(840.)), cx);
 		let window = WindowOptions {
 			window_bounds: Some(WindowBounds::Windowed(bounds)),

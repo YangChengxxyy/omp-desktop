@@ -367,7 +367,12 @@ async fn external_session_is_listed_resumed_reconnected_and_forked(cx: &mut Test
 	let original = workspace.read_with(cx, |w, _| w.listed()[0].path.clone());
 
 	// Open it: a second tab resumes the file and shows its history.
-	cx.update_window(handle, |_, window, cx| window.click(("session-row", 0usize), cx)).unwrap();
+	cx.update_window(handle, |_, window, cx| {
+		window.render_frame(cx);
+		window.click(("group", 0usize), cx);
+		window.click(("session-row", 0usize), cx);
+	})
+	.unwrap();
 	assert_eq!(workspace.read_with(cx, |w, _| (w.tab_views().len(), w.active_index())), (2, 1));
 	let tab = workspace.read_with(cx, |w, _| w.tab_views()[1].clone());
 	wait_until(cx, Duration::from_secs(60), "resumed tab connects", |cx| tab.read_with(cx, |v, _| v.is_connected()));
@@ -400,7 +405,13 @@ async fn external_session_is_listed_resumed_reconnected_and_forked(cx: &mut Test
 	assert_eq!(tab.read_with(cx, |v, _| v.user_texts()).len(), 2, "history reloaded from the file");
 
 	// Fork: a third tab continues a copy in a new file.
-	cx.update_window(handle, |_, window, cx| window.click(("session-fork", 0usize), cx)).unwrap();
+	cx.update_window(handle, |_, window, cx| {
+		workspace.update(cx, |w, cx| {
+			let s = w.listed()[0].clone();
+			w.open_session(&s.path, &s.cwd, true, window, cx);
+		});
+	})
+	.unwrap();
 	let fork = workspace.read_with(cx, |w, _| w.tab_views()[2].clone());
 	wait_until(cx, Duration::from_secs(60), "fork connects", |cx| {
 		fork.read_with(cx, |v, _| v.is_connected() && v.session_file().is_some_and(|f| f != original))
@@ -442,8 +453,9 @@ async fn shortcuts_open_switch_and_close_tabs(cx: &mut TestAppContext) {
 	wait_until(cx, Duration::from_secs(10), "closed tab's process exits", |_| !process_alive(first_pid));
 	press(cx, "secondary-w");
 	press(cx, "secondary-w");
-	// Closing the last tab leaves a fresh one.
-	assert_eq!(tabs(cx).0, 1);
+	// Closing the last tab starts no new omp; ⌘N does.
+	assert_eq!(tabs(cx).0, 0);
+	press(cx, "secondary-n");
 	let fresh = workspace.read_with(cx, |w, _| w.tab_views()[0].clone());
 	wait_until(cx, Duration::from_secs(60), "fresh tab connects", |cx| fresh.read_with(cx, |v, _| v.is_connected()));
 	// A new session writes no file until its first message.
@@ -472,7 +484,14 @@ fn open_workspace(
 				..Default::default()
 			},
 			cx,
-			|window, cx| cx.new(|cx| Workspace::new(base, cwd, window, cx)),
+			// The app starts with no tab; these tests start from one session.
+			|window, cx| {
+				cx.new(|cx| {
+					let mut workspace = Workspace::new(base, cwd.clone(), window, cx);
+					workspace.new_tab(cwd, window, cx);
+					workspace
+				})
+			},
 		)
 		.expect("open window")
 	})
@@ -1022,7 +1041,14 @@ async fn missing_credentials_point_to_login(cx: &mut TestAppContext) {
 				..Default::default()
 			},
 			cx,
-			|window, cx| cx.new(|cx| Workspace::new(base, cwd, window, cx)),
+			// The app starts with no tab; these tests start from one session.
+			|window, cx| {
+				cx.new(|cx| {
+					let mut workspace = Workspace::new(base, cwd.clone(), window, cx);
+					workspace.new_tab(cwd, window, cx);
+					workspace
+				})
+			},
 		)
 		.expect("open window")
 	});

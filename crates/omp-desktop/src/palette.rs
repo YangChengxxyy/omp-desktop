@@ -6,6 +6,7 @@
 #[derive(Clone, Debug, PartialEq)]
 pub enum Command {
 	NewTab,
+	NewTabInDir,
 	CloseTab,
 	SearchSessions,
 	ToggleSidebar,
@@ -43,6 +44,10 @@ impl Group {
 pub struct Entry {
 	pub group:    Group,
 	pub title:    String,
+	/// Human-readable display name when `title` is an identifier (e.g. model name).
+	pub subtitle: Option<String>,
+	/// Provider badge shown on the right for model entries.
+	pub provider: Option<String>,
 	/// Searched with the title, shown dimmed (provider, description).
 	pub detail:   String,
 	pub shortcut: Option<&'static str>,
@@ -53,7 +58,26 @@ pub struct Entry {
 
 impl Entry {
 	pub fn new(group: Group, title: impl Into<String>, command: Command) -> Self {
-		Self { group, title: title.into(), detail: String::new(), shortcut: None, current: false, command }
+		Self {
+			group,
+			title: title.into(),
+			subtitle: None,
+			provider: None,
+			detail: String::new(),
+			shortcut: None,
+			current: false,
+			command,
+		}
+	}
+
+	pub fn subtitle(mut self, subtitle: Option<String>) -> Self {
+		self.subtitle = subtitle;
+		self
+	}
+
+	pub fn provider(mut self, provider: impl Into<String>) -> Self {
+		self.provider = Some(provider.into());
+		self
 	}
 
 	pub fn detail(mut self, detail: impl Into<String>) -> Self {

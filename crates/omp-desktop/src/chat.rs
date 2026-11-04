@@ -10,7 +10,6 @@ use gpui_kit::component::input::{
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::progress::Progress;
 use gpui_kit::component::switch::Switch;
-use gpui_kit::component::text::TextView;
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, Selectable as _, Sizable as _};
 use gpui_kit::prelude::*;
@@ -26,6 +25,7 @@ use omp_rpc::{
 use omp_store::display::{Block, Role, View};
 
 use crate::attachments;
+use crate::copy;
 use crate::dialog::{self, DialogEvent, DialogView};
 use crate::session::{Activity, Notice, PendingControl, SessionModel};
 use crate::slash;
@@ -278,6 +278,37 @@ impl ChatView {
 		if matches!(self.connection, Connection::Failed(_) | Connection::NeedsLogin(_)) && self.model.row_count() == 0 {
 			self.reconnect(cx);
 		}
+	}
+
+	/// Prompts for a working directory and restarts this empty session in it.
+	fn prompt_change_cwd(&mut self, cx: &mut Context<Self>) {
+		let rx = cx.prompt_for_paths(PathPromptOptions {
+			files:       false,
+			directories: true,
+			multiple:    false,
+			prompt:      Some("选择工作目录".into()),
+		});
+		cx.spawn(async move |this, cx| {
+			if let Ok(Ok(Some(mut paths))) = rx.await
+				&& let Some(dir) = paths.pop()
+			{
+				_ = this.update(cx, |this, cx| this.set_cwd(dir, cx));
+			}
+		})
+		.detach();
+	}
+
+	pub fn set_cwd(&mut self, cwd: PathBuf, cx: &mut Context<Self>) {
+		let cwd = std::fs::canonicalize(&cwd).unwrap_or(cwd);
+		if self.cwd == cwd || self.model.row_count() > 0 {
+			return;
+		}
+		self.shutdown(cx);
+		self.cwd = cwd.clone();
+		self.options.cwd = Some(cwd);
+		self.options.resume = None;
+		self.session_file = None;
+		self.reconnect(cx);
 	}
 
 	/// Stops the process. Teardown waits for the process group, so the last
@@ -895,8 +926,12 @@ impl ChatView {
 			.models
 			.iter()
 			.map(|m| {
+				let name = m.name.trim();
+				let has_distinct_name = !name.is_empty() && name != m.id;
 				Entry::new(Group::Model, m.id.clone(), Command::SetModel { provider: m.provider.clone(), id: m.id.clone() })
-					.detail(if m.name == m.id { m.provider.clone() } else { format!("{} · {}", m.provider, m.name) })
+					.subtitle(has_distinct_name.then(|| name.to_owned()))
+					.provider(m.provider.clone())
+					.detail(if has_distinct_name { format!("{} · {}", m.provider, name) } else { m.provider.clone() })
 					.current(current.is_some_and(|c| c.provider == m.provider && c.id == m.id))
 			})
 			.collect();
@@ -1066,44 +1101,72 @@ impl ChatView {
 			return div().into_any_element();
 		};
 		let view = entry.view();
-		let content = div().w_full().max_w(px(920.)).mx_auto().px_4();
+		let content = div().w_full().px_6();
 		match &view.role {
 			Role::Hidden => div().into_any_element(),
-			Role::User => content
-				.py_2()
-				.flex()
-				.justify_end()
-				.child(
-					div()
-						.max_w(px(680.))
-						.px_3()
-						.py_2()
-						.rounded(px(8.))
-						.bg(rgb(p.accent))
-						.text_sm()
-						.flex()
-						.flex_col()
-						.gap_2()
-						.children(view.blocks.iter().enumerate().map(|(bi, block)| match block {
-							Block::Text(text) => div().child(text.clone()).into_any_element(),
-							Block::Image { mime_type, data } => self.render_image(index, bi, mime_type, data, cx),
-							_ => div().into_any_element(),
-						})),
-				)
-				.into_any_element(),
-			Role::Assistant => content
-				.py_2()
-				.flex()
-				.flex_col()
-				.gap_2()
-				.children(view.blocks.iter().enumerate().map(|(bi, block)| self.render_block(index, bi, block, &view, cx)))
-				.when(view.streaming && view.blocks.is_empty(), |col| {
-					col.child(div().text_sm().text_color(rgb(p.muted_foreground)).child("思考中…"))
-				})
-				.when_some(view.error.clone(), |col, error| {
-					col.child(div().text_sm().text_color(rgb(p.danger)).child(format!("错误：{error}")))
-				})
-				.into_any_element(),
+			Role::User => {
+				let source = view.blocks.iter().filter_map(|b| if let Block::Text(t) = b { Some(t.as_str()) } else { None }).collect::<Vec<_>>().join("\n\n");
+				content
+					.py_2()
+					.flex()
+					.justify_end()
+					.items_start()
+					.gap_1()
+					.group(copy::HOVER_GROUP)
+					.when(!source.is_empty(), |row| {
+						row.child(
+							div()
+								.invisible()
+								.group_hover(copy::HOVER_GROUP, |s| s.visible())
+								.child(copy::button(("copy-user", index), source, "复制消息")),
+						)
+					})
+					.child(
+						div()
+							.max_w(px(760.))
+							.px_3()
+							.py_2()
+							.rounded(px(8.))
+							.bg(rgb(p.accent))
+							.text_sm()
+							.flex()
+							.flex_col()
+							.gap_2()
+							.children(view.blocks.iter().enumerate().map(|(bi, block)| match block {
+								Block::Text(text) => div().child(text.clone()).into_any_element(),
+								Block::Image { mime_type, data } => self.render_image(index, bi, mime_type, data, cx),
+								_ => div().into_any_element(),
+							})),
+					)
+					.into_any_element()
+			},
+			Role::Assistant => {
+				// The reply's Markdown source, without thinking or tool calls.
+				let source = view.blocks.iter().filter_map(|b| if let Block::Text(t) = b { Some(t.trim()) } else { None }).filter(|t| !t.is_empty()).collect::<Vec<_>>().join("\n\n");
+				content
+					.py_2()
+					.flex()
+					.flex_col()
+					.gap_2()
+					.group(copy::HOVER_GROUP)
+					.children(view.blocks.iter().enumerate().map(|(bi, block)| self.render_block(index, bi, block, &view, cx)))
+					.when(view.streaming && view.blocks.is_empty(), |col| {
+						col.child(div().text_sm().text_color(rgb(p.muted_foreground)).child("思考中…"))
+					})
+					.when_some(view.error.clone(), |col, error| {
+						col.child(div().text_sm().text_color(rgb(p.danger)).child(format!("错误：{error}")))
+					})
+					.when(!view.streaming && !source.is_empty(), |col| {
+						col.child(
+							div()
+								.flex()
+								.invisible()
+								.group_hover(copy::HOVER_GROUP, |s| s.visible())
+								.child(copy::button(("copy-reply", index), source, "复制回复（Markdown）")),
+						)
+					})
+					.into_any_element()
+			},
 			Role::Command => {
 				let text = view.blocks.iter().filter_map(|b| if let Block::Output(t) = b { Some(t.as_str()) } else { None }).collect::<Vec<_>>().join("\n");
 				content
@@ -1111,6 +1174,8 @@ impl ChatView {
 					.child(
 						div()
 							.id(("command-output", index))
+							.relative()
+							.group(copy::HOVER_GROUP)
 							.rounded(px(6.))
 							.border_l_2()
 							.border_color(rgb(p.border))
@@ -1120,7 +1185,16 @@ impl ChatView {
 							.font_family("Menlo")
 							.text_xs()
 							.text_color(rgb(p.muted_foreground))
-							.child(text)
+							.child(text.clone())
+							.child(
+								div()
+									.absolute()
+									.top_1()
+									.right_1()
+									.invisible()
+									.group_hover(copy::HOVER_GROUP, |s| s.visible())
+									.child(copy::button(("copy-command", index), text, "复制输出")),
+							)
 							.test_support(),
 					)
 					.into_any_element()
@@ -1190,9 +1264,9 @@ impl ChatView {
 		let p = theme::palette(cx);
 		match block {
 			Block::Text(text) => div()
-				.max_w(px(680.))
+				.w_full()
 				.text_sm()
-				.child(TextView::markdown(ElementId::NamedInteger("md".into(), (row * 64 + bi) as u64), text.clone()))
+				.child(copy::markdown(ElementId::NamedInteger("md".into(), (row * 64 + bi) as u64), text.clone()))
 				.into_any_element(),
 			Block::Thinking(text) => {
 				let open = self.expanded.contains(&(row, bi));
@@ -1200,7 +1274,7 @@ impl ChatView {
 				let summary = if live { "思考中…" } else { "思考过程" };
 				div()
 					.id(("thinking", row * 64 + bi))
-					.max_w(px(680.))
+					.w_full()
 					.rounded(px(6.))
 					.border_1()
 					.border_color(rgb(p.thinking_border))
@@ -1265,7 +1339,15 @@ impl ChatView {
 		let pending = self.model.pending;
 		let this = cx.entity().downgrade();
 
-		let current = state.and_then(|s| s.model.as_ref()).map(|m| (m.provider.clone(), m.id.clone()));
+		let current_model = state.and_then(|s| s.model.as_ref());
+		let current = current_model.map(|m| (m.provider.clone(), m.id.clone()));
+		let model_label = current_model.map_or_else(
+			|| "模型".to_owned(),
+			|m| {
+				let name = if m.name.trim().is_empty() { m.id.as_str() } else { m.name.as_str() };
+				format!("{} · {} ▾", truncate(name, 30), m.provider)
+			},
+		);
 		let models = self.models.clone();
 		let model_menu = {
 			let this = this.clone();
@@ -1273,20 +1355,69 @@ impl ChatView {
 			Button::new("status-model")
 				.ghost()
 				.xsmall()
-				.label(current.as_ref().map_or_else(|| "模型".to_owned(), |(_, id)| format!("{id} ▾")))
+				.label(model_label)
 				.tooltip("切换模型（仅本会话，⌘M）")
 				.loading(pending == Some(PendingControl::Model))
 				.disabled(!connected || pending.is_some() || models.is_empty())
 				.dropdown_menu_with_anchor(Anchor::BottomRight, move |menu, _, _| {
-					let mut menu = menu.scrollable(true).max_h(px(420.));
+					let mut menu = menu.scrollable(true).max_w(px(520.)).max_h(px(420.));
 					for model in &models {
 						let key = (model.provider.clone(), model.id.clone());
 						let this = this.clone();
 						let checked = current.as_ref() == Some(&key);
-						menu = menu.item(PopupMenuItem::new(model.id.clone()).checked(checked).on_click(move |_, _, cx| {
-							let (provider, id) = key.clone();
-							_ = this.update(cx, |view, cx| view.set_model(provider, id, cx));
-						}));
+						let name = if model.name.trim().is_empty() { model.id.clone() } else { model.name.clone() };
+						let id_sub = (name != model.id).then(|| model.id.clone());
+						let provider = model.provider.clone();
+						menu = menu.item(
+							PopupMenuItem::element(move |_, cx| {
+								let p = theme::palette(cx);
+								let has_id = id_sub.is_some();
+								div()
+									.w(px(476.))
+									.max_w(px(476.))
+									.overflow_hidden()
+									.flex()
+									.items_center()
+									.justify_between()
+									.gap_2()
+									.child(
+										div()
+											.flex_1()
+											.min_w_0()
+											.overflow_hidden()
+											.flex()
+											.items_baseline()
+											.gap_1p5()
+											.child(
+												div()
+													.when(has_id, |d| d.flex_none().max_w(px(230.)))
+													.when(!has_id, |d| d.flex_1().min_w_0())
+													.truncate()
+													.font_weight(FontWeight::MEDIUM)
+													.child(name.clone()),
+											)
+											.when_some(id_sub.clone(), |row, id| {
+												row.child(div().flex_1().min_w_0().truncate().text_xs().text_color(rgb(p.muted_foreground)).child(id))
+											}),
+									)
+									.child(
+										div()
+											.flex_none()
+											.px_1p5()
+											.py_0p5()
+											.rounded(px(4.))
+											.bg(rgb(p.muted))
+											.text_xs()
+											.text_color(rgb(p.muted_foreground))
+											.child(provider.clone()),
+									)
+							})
+							.checked(checked)
+							.on_click(move |_, _, cx| {
+								let (provider, id) = key.clone();
+								_ = this.update(cx, |view, cx| view.set_model(provider, id, cx));
+							}),
+						);
 					}
 					menu
 				})
@@ -1659,9 +1790,7 @@ impl ChatView {
 		div()
 			.flex_none()
 			.w_full()
-			.max_w(px(920.))
-			.mx_auto()
-			.px_4()
+			.px_6()
 			.pb_3()
 			.flex()
 			.flex_col()
@@ -1843,7 +1972,22 @@ impl Render for ChatView {
 				.justify_center()
 				.gap_2()
 				.child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child("开始一个新会话"))
-				.child(div().text_sm().text_color(rgb(p.muted_foreground)).child(format!("工作目录 {}", self.cwd.display())))
+				.child(
+					div()
+						.flex()
+						.items_center()
+						.gap_2()
+						.text_sm()
+						.text_color(rgb(p.muted_foreground))
+						.child(format!("工作目录 {}", self.cwd.display()))
+						.child(
+							Button::new("change-cwd")
+								.outline()
+								.xsmall()
+								.label("选择目录…")
+								.on_click(cx.listener(|this, _, _, cx| this.prompt_change_cwd(cx))),
+						),
+				)
 				.child(
 					div()
 						.text_xs()

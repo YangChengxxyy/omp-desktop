@@ -38,13 +38,25 @@ pub fn import_shell_path() {
 }
 
 /// The working directory for the first tab when none was given: cwd, unless
-/// launched from the GUI (cwd `/`), then home.
+/// launched from the GUI (cwd `/`), then the directory saved in
+/// `~/Library/Application Support/omp-desktop/default-cwd` if it exists, else home.
 pub fn default_cwd() -> PathBuf {
 	let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
-	if cwd == Path::new("/") && let Some(home) = home() {
-		return home;
+	if cwd != Path::new("/") {
+		return cwd;
 	}
-	cwd
+	if let Some(dir) = configured_cwd() {
+		return dir;
+	}
+	home().unwrap_or(cwd)
+}
+
+/// The saved launch directory (one path, `~/` allowed), when it is a directory.
+fn configured_cwd() -> Option<PathBuf> {
+	let file = home()?.join("Library/Application Support/omp-desktop/default-cwd");
+	let text = std::fs::read_to_string(file).ok()?;
+	let dir = expand_home(text.trim());
+	(!text.trim().is_empty() && dir.is_dir()).then_some(dir)
 }
 
 /// The omp binary: first match on PATH, then the usual install directories,

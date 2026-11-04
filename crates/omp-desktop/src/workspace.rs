@@ -6,7 +6,7 @@
 //! · ⌘M pick a model · ⌘T cycle the thinking level · ⌘⇧L accounts.
 
 use std::{
-	collections::HashSet,
+	collections::{HashMap, HashSet},
 	path::{Path, PathBuf},
 	time::{Duration, SystemTime},
 };
@@ -15,7 +15,7 @@ use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
-use gpui_kit::component::{ActiveTheme as _, Sizable as _, TitleBar};
+use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _, TitleBar};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use omp_bridge::SessionOptions;
@@ -31,27 +31,134 @@ use crate::theme::{self, ThemeChoice};
 /// at most 4 KiB per file, so polling is cheap. Tabs also trigger a rescan
 /// when their session file appears or a turn settles.
 const RESCAN_EVERY: Duration = Duration::from_secs(3);
+/// Sessions shown per sidebar folder before "show more".
+const GROUP_PREVIEW_SESSIONS: usize = 5;
+
+actions!(
+	workspace,
+	[
+		Hide,
+		HideOthers,
+		ShowAll,
+		Quit,
+		NewTab,
+		NewTabInDir,
+		CloseTab,
+		SearchSessions,
+		ToggleSidebar,
+		TogglePanel,
+		CommandPalette,
+		ModelPalette,
+		CycleThinking,
+		OpenAccounts,
+		MinimizeWindow,
+		ZoomWindow,
+		ToggleFullScreen,
+		NextTab,
+		PreviousTab,
+	]
+);
+
+/// Registers the native application menu bar (including the `Window` menu
+/// that macOS populates with window controls and open windows) and global
+/// app-level actions (`⌘Q`, `⌘H`, `⌥⌘H`).
+pub fn init_menus(cx: &mut App) {
+	use gpui_kit::component::input::{Copy, Cut, Paste, Redo, SelectAll, Undo};
+
+	cx.on_action(|_: &Hide, cx| cx.hide());
+	cx.on_action(|_: &HideOthers, cx| cx.hide_other_apps());
+	cx.on_action(|_: &ShowAll, cx| cx.unhide_other_apps());
+	cx.on_action(|_: &Quit, cx| cx.quit());
+
+	cx.bind_keys([
+		KeyBinding::new("cmd-h", Hide, None),
+		KeyBinding::new("alt-cmd-h", HideOthers, None),
+		KeyBinding::new("cmd-q", Quit, None),
+		KeyBinding::new("cmd-n", NewTab, None),
+		KeyBinding::new("cmd-o", NewTabInDir, None),
+		KeyBinding::new("cmd-w", CloseTab, None),
+		KeyBinding::new("cmd-p", SearchSessions, None),
+		KeyBinding::new("cmd-b", ToggleSidebar, None),
+		KeyBinding::new("cmd-j", TogglePanel, None),
+		KeyBinding::new("cmd-k", CommandPalette, None),
+		KeyBinding::new("cmd-m", ModelPalette, None),
+		KeyBinding::new("cmd-t", CycleThinking, None),
+		KeyBinding::new("cmd-shift-l", OpenAccounts, None),
+		KeyBinding::new("ctrl-cmd-f", ToggleFullScreen, None),
+		KeyBinding::new("cmd-shift-]", NextTab, None),
+		KeyBinding::new("cmd-shift-[", PreviousTab, None),
+	]);
+
+	cx.set_menus(vec![
+		Menu::new("omp-desktop").items([
+			MenuItem::os_submenu("服务", SystemMenuType::Services),
+			MenuItem::separator(),
+			MenuItem::action("隐藏 omp-desktop", Hide),
+			MenuItem::action("隐藏其他", HideOthers),
+			MenuItem::action("全部显示", ShowAll),
+			MenuItem::separator(),
+			MenuItem::action("退出 omp-desktop", Quit),
+		]),
+		Menu::new("File").items([
+			MenuItem::action("新建会话（当前目录）", NewTab),
+			MenuItem::action("选择目录新建会话…", NewTabInDir),
+			MenuItem::separator(),
+			MenuItem::action("搜索会话", SearchSessions),
+			MenuItem::separator(),
+			MenuItem::action("关闭会话", CloseTab),
+		]),
+		Menu::new("Edit").items([
+			MenuItem::os_action("撤销", Undo, OsAction::Undo),
+			MenuItem::os_action("重做", Redo, OsAction::Redo),
+			MenuItem::separator(),
+			MenuItem::os_action("剪切", Cut, OsAction::Cut),
+			MenuItem::os_action("拷贝", Copy, OsAction::Copy),
+			MenuItem::os_action("粘贴", Paste, OsAction::Paste),
+			MenuItem::os_action("全选", SelectAll, OsAction::SelectAll),
+		]),
+		Menu::new("View").items([
+			MenuItem::action("命令面板…", CommandPalette),
+			MenuItem::action("切换模型…", ModelPalette),
+			MenuItem::action("循环思考档位", CycleThinking),
+			MenuItem::separator(),
+			MenuItem::action("显示 / 隐藏会话栏", ToggleSidebar),
+			MenuItem::action("状态面板", TogglePanel),
+			MenuItem::separator(),
+			MenuItem::action("账号与登录…", OpenAccounts),
+		]),
+		Menu::new("Window").items([
+			MenuItem::action("最小化", MinimizeWindow),
+			MenuItem::action("缩放", ZoomWindow),
+			MenuItem::action("进入全屏幕", ToggleFullScreen),
+			MenuItem::separator(),
+			MenuItem::action("显示上一个标签页", PreviousTab),
+			MenuItem::action("显示下一个标签页", NextTab),
+		]),
+	]);
+}
 
 pub struct Workspace {
 	/// Launch settings shared by every tab (`omp` path, `--session-dir`,
 	/// extra flags); `cwd` and `resume` are set per tab.
-	base:        SessionOptions,
-	default_cwd: PathBuf,
+	base:            SessionOptions,
+	default_cwd:     PathBuf,
 	/// Where saved sessions are listed from.
-	root:        Option<PathBuf>,
-	tabs:        Vec<Tab>,
-	active:      usize,
-	scan:        Scan,
-	search:      Entity<InputState>,
-	sidebar:     bool,
-	/// Sidebar groups the user folded, by cwd.
-	collapsed:   HashSet<PathBuf>,
+	root:            Option<PathBuf>,
+	tabs:            Vec<Tab>,
+	active:          usize,
+	scan:            Scan,
+	search:          Entity<InputState>,
+	sidebar:         bool,
+	/// Sidebar groups the user unfolded, by cwd. Groups start folded.
+	unfolded:        HashSet<PathBuf>,
+	/// Sidebar groups expanded past [`GROUP_PREVIEW_SESSIONS`], by cwd.
+	expanded_groups: HashSet<PathBuf>,
 	/// The accounts modal, while open; it runs its own omp process.
-	accounts:    Option<(Entity<AccountsView>, Subscription)>,
+	accounts:        Option<(Entity<AccountsView>, Subscription)>,
 	/// The command palette (⌘K, or ⌘M for models only), while open.
-	palette:     Option<(Entity<PaletteView>, Subscription)>,
-	_tasks:      Vec<Task<()>>,
-	_subs:       Vec<Subscription>,
+	palette:         Option<(Entity<PaletteView>, Subscription)>,
+	_tasks:          Vec<Task<()>>,
+	_subs:           Vec<Subscription>,
 }
 
 struct Tab {
@@ -80,7 +187,8 @@ impl Workspace {
 			scan: Scan::default(),
 			search,
 			sidebar: true,
-			collapsed: HashSet::new(),
+			unfolded: HashSet::new(),
+			expanded_groups: HashSet::new(),
 			accounts: None,
 			palette: None,
 			_tasks: Vec::new(),
@@ -91,7 +199,9 @@ impl Workspace {
 			theme::appearance_changed(window, cx);
 		});
 		this._subs.push(appearance);
-		this.new_tab(cwd, window, cx);
+		// No tab at launch: starting omp is slow, so wait until the user opens
+		// a session. The search box takes focus so ⌘ shortcuts work at once.
+		this.search.update(cx, |state, cx| state.focus(window, cx));
 		let poll = cx.spawn(async move |this, cx| {
 			loop {
 				if this.update(cx, |this, cx| this.rescan(cx)).is_err() {
@@ -139,6 +249,46 @@ impl Workspace {
 		self.push_tab(view, window, cx);
 	}
 
+	/// Opens the native folder picker and starts a new session in the chosen directory.
+	pub fn prompt_new_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+		let rx = cx.prompt_for_paths(PathPromptOptions {
+			files:       false,
+			directories: true,
+			multiple:    false,
+			prompt:      Some("选择工作目录".into()),
+		});
+		cx.spawn_in(window, async move |this, cx| {
+			if let Ok(Ok(Some(mut paths))) = rx.await
+				&& let Some(dir) = paths.pop()
+			{
+				let dir = std::fs::canonicalize(&dir).unwrap_or(dir);
+				_ = this.update_in(cx, |this, window, cx| this.new_tab(dir, window, cx));
+			}
+		})
+		.detach();
+	}
+
+	/// Unique working directories known to the workspace (active tab first, then recent sessions).
+	fn known_cwds(&self) -> Vec<PathBuf> {
+		let mut cwds = Vec::new();
+		let mut push = |path: &Path| {
+			if !cwds.iter().any(|p| p == path) {
+				cwds.push(path.to_path_buf());
+			}
+		};
+		if let Some(tab) = self.tabs.get(self.active) {
+			push(&tab.summary.cwd);
+		}
+		for tab in &self.tabs {
+			push(&tab.summary.cwd);
+		}
+		push(&self.default_cwd);
+		for session in &self.scan.sessions {
+			push(&session.cwd);
+		}
+		cwds
+	}
+
 	/// Opens a saved session: switches to its tab when one already has it,
 	/// otherwise resumes it in a new tab. `fork` continues a copy instead.
 	pub fn open_session(&mut self, path: &Path, cwd: &Path, fork: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -167,8 +317,8 @@ impl Workspace {
 		cx.notify();
 	}
 
-	/// Closes a tab and stops its omp process. The window always keeps one
-	/// tab: closing the last opens a new session in the same directory.
+	/// Closes a tab and stops its omp process. Closing the last one leaves the
+	/// empty state rather than starting another omp.
 	pub fn close_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
 		if index >= self.tabs.len() {
 			return;
@@ -176,7 +326,9 @@ impl Workspace {
 		let tab = self.tabs.remove(index);
 		tab.view.update(cx, |view, cx| view.shutdown(cx));
 		if self.tabs.is_empty() {
-			self.new_tab(tab.summary.cwd, window, cx);
+			self.active = 0;
+			self.search.update(cx, |state, cx| state.focus(window, cx));
+			cx.notify();
 			return;
 		}
 		if index < self.active || self.active >= self.tabs.len() {
@@ -242,7 +394,8 @@ impl Workspace {
 		} else {
 			let theme = theme::choice(cx);
 			let mut entries = vec![
-				Entry::new(Group::Action, "新建会话", Command::NewTab).detail("new tab").shortcut("⌘N"),
+				Entry::new(Group::Action, "新建会话（当前目录）", Command::NewTab).detail("new tab").shortcut("⌘N"),
+				Entry::new(Group::Action, "选择目录新建会话…", Command::NewTabInDir).detail("new tab directory folder open").shortcut("⌘O"),
 				Entry::new(Group::Action, "关闭会话", Command::CloseTab).detail("close tab").shortcut("⌘W"),
 				Entry::new(Group::Action, "搜索会话", Command::SearchSessions).detail("search sessions").shortcut("⌘P"),
 				Entry::new(Group::Action, "显示 / 隐藏会话栏", Command::ToggleSidebar).detail("sidebar").shortcut("⌘B"),
@@ -288,6 +441,7 @@ impl Workspace {
 				let cwd = self.tabs.get(self.active).map_or(self.default_cwd.clone(), |tab| tab.summary.cwd.clone());
 				self.new_tab(cwd, window, cx);
 			},
+			Command::NewTabInDir => self.prompt_new_tab(window, cx),
 			Command::CloseTab => self.close_tab(self.active, window, cx),
 			Command::SearchSessions => self.focus_search(window, cx),
 			Command::ToggleSidebar => {
@@ -348,6 +502,7 @@ impl Workspace {
 				let cwd = self.tabs.get(self.active).map_or(self.default_cwd.clone(), |tab| tab.summary.cwd.clone());
 				self.new_tab(cwd, window, cx);
 			},
+			"o" => self.prompt_new_tab(window, cx),
 			"w" => self.close_tab(self.active, window, cx),
 			"p" => self.focus_search(window, cx),
 			"b" => {
@@ -393,17 +548,11 @@ impl Workspace {
 		&self.scan.sessions
 	}
 
-	fn render_tab_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+	fn render_tab_bar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
 		let p = theme::palette(cx);
 		let tabs = self.tabs.iter().enumerate().map(|(index, tab)| {
 			let active = index == self.active;
-			let (dot, badge) = match tab.summary.status {
-				TabStatus::Connecting => (p.warning, None),
-				TabStatus::Idle => (p.success, None),
-				TabStatus::Running => (p.primary, Some("•••")),
-				TabStatus::Attention => (p.warning, Some("待确认")),
-				TabStatus::Disconnected => (p.danger, Some("已断开")),
-			};
+			let (dot, badge) = status_style(tab.summary.status, p);
 			div()
 				.id(("tab", index))
 				.flex()
@@ -437,6 +586,9 @@ impl Workspace {
 				.test_support()
 		});
 		TitleBar::new()
+			// The default left padding clears the traffic lights, which macOS
+			// hides in fullscreen; the bar adds its own small inset there.
+			.when(window.is_fullscreen(), |bar| bar.pl(px(0.)))
 			.child(
 				div()
 					.flex_1()
@@ -446,12 +598,7 @@ impl Workspace {
 					.items_center()
 					.gap_1()
 					.children(tabs)
-					.child(Button::new("tab-new").ghost().xsmall().label("+").tooltip("新建会话（⌘N）").on_click(
-						cx.listener(|this, _, window, cx| {
-							let cwd = this.tabs.get(this.active).map_or(this.default_cwd.clone(), |t| t.summary.cwd.clone());
-							this.new_tab(cwd, window, cx);
-						}),
-					)),
+					.child(self.render_new_session_menu("tab-new", true, Anchor::TopLeft, cx))
 			)
 			.child(
 				div().pr_2().flex().gap_1().child({
@@ -490,64 +637,204 @@ impl Workspace {
 			)
 	}
 
+	fn render_new_session_menu(
+		&self,
+		id: &'static str,
+		xsmall: bool,
+		anchor: Anchor,
+		cx: &mut Context<Self>,
+	) -> impl IntoElement {
+		let this = cx.entity().downgrade();
+		let cwds = self.known_cwds();
+		let btn = Button::new(id).ghost().label("+").tooltip("新建会话（可选择目录）");
+		let btn = if xsmall { btn.xsmall() } else { btn.small() };
+		btn.dropdown_menu_with_anchor(anchor, move |menu, _, _| {
+			let this_pick = this.clone();
+			let mut menu = menu
+				.scrollable(true)
+				.max_w(px(340.))
+				.max_h(px(360.))
+				.item(
+					PopupMenuItem::new("选择目录新建会话…")
+						.icon(IconName::FolderOpen)
+						.on_click(move |_, window, cx| {
+							_ = this_pick.update(cx, |this, cx| this.prompt_new_tab(window, cx));
+						}),
+				)
+				.item(PopupMenuItem::separator())
+				.item(PopupMenuItem::label("在已有目录新建"));
+			for cwd in &cwds {
+				let cwd = cwd.clone();
+				let this_dir = this.clone();
+				let name = folder_name(&cwd);
+				let path_str = display_path(&cwd);
+				menu = menu.item(
+					PopupMenuItem::element(move |_, cx| {
+						let p = theme::palette(cx);
+						div()
+							.w(px(296.))
+							.max_w(px(296.))
+							.overflow_hidden()
+							.flex()
+							.items_center()
+							.justify_between()
+							.gap_2()
+							.child(div().flex_none().max_w(px(130.)).truncate().font_weight(FontWeight::MEDIUM).child(name.clone()))
+							.child(div().flex_1().min_w_0().truncate().text_right().text_xs().text_color(rgb(p.muted_foreground)).child(path_str.clone()))
+					})
+					.icon(IconName::Folder)
+					.on_click(move |_, window, cx| {
+						let cwd = cwd.clone();
+						_ = this_dir.update(cx, |this, cx| this.new_tab(cwd, window, cx));
+					}),
+				);
+			}
+			menu
+		})
+	}
+
+	/// Shown when no tab is open: start a session in the default directory,
+	/// or pick one from the sidebar.
+	fn render_empty(&self, cx: &mut Context<Self>) -> impl IntoElement {
+		let p = theme::palette(cx);
+		let cwd = self.default_cwd.clone();
+		div()
+			.id("empty-state")
+			.flex_1()
+			.min_w_0()
+			.h_full()
+			.flex()
+			.flex_col()
+			.items_center()
+			.justify_center()
+			.gap_3()
+			.child(div().text_color(rgb(p.muted_foreground)).child("从左侧选择会话继续，或新建会话"))
+			.child(
+				Button::new("empty-new")
+					.primary()
+					.label(format!("在 {} 新建会话  ⌘N", display_path(&cwd)))
+					.on_click(cx.listener(move |this, _, window, cx| this.new_tab(cwd.clone(), window, cx))),
+			)
+	}
+
 	fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
 		let p = theme::palette(cx);
 		let query = self.search.read(cx).value().to_string();
 		let searching = !query.trim().is_empty();
 		let groups = sessions::group(&self.scan.sessions, &query);
-		let selected = self.tabs.get(self.active).and_then(|tab| tab.summary.session_file.clone());
-		let open: HashSet<PathBuf> = self.tabs.iter().filter_map(|tab| tab.summary.session_file.clone()).collect();
+		let active_tab = self.tabs.get(self.active);
+		let selected = active_tab.and_then(|tab| tab.summary.session_file.clone());
+		// Sessions open in a tab, with that tab's status, so the list mirrors the tab bar.
+		let open: HashMap<&Path, TabStatus> = self
+			.tabs
+			.iter()
+			.filter_map(|tab| tab.summary.session_file.as_deref().map(|file| (file, tab.summary.status)))
+			.collect();
+		let active_cwd = active_tab.map(|tab| tab.summary.cwd.as_path());
 		let now = SystemTime::now();
 		let mut row = 0usize;
 		let mut items: Vec<AnyElement> = Vec::new();
 		for (gi, group) in groups.iter().enumerate() {
 			let cwd = group.cwd.to_owned();
-			let folded = !searching && self.collapsed.contains(&cwd);
+			let folded = !searching && !self.unfolded.contains(&cwd);
+			let is_active_group = active_cwd == Some(group.cwd);
 			let (toggle, new_cwd) = (cwd.clone(), cwd.clone());
+			let icon = if folded { IconName::FolderClosed } else { IconName::FolderOpen };
+			let icon_color = if is_active_group { p.primary } else { p.muted_foreground };
 			items.push(
 				div()
 					.id(("group", gi))
 					.flex()
 					.items_center()
-					.gap_1()
-					.mt_2()
-					.px_2()
-					.h(px(24.))
-					.rounded(px(6.))
-					.text_xs()
-					.text_color(rgb(p.muted_foreground))
+					.gap_2()
+					.mt(if gi == 0 { px(2.) } else { px(8.) })
+					.px_2p5()
+					.h(px(34.))
+					.rounded(px(8.))
 					.cursor_pointer()
 					.hover(|s| s.bg(rgb(p.muted)))
-					.child(if folded { "▸" } else { "▾" })
-					.child(div().flex_1().min_w_0().truncate().child(display_path(&cwd)))
-					.child(group.sessions.len().to_string())
-					.child(Button::new(("group-new", gi)).ghost().xsmall().label("+").tooltip("在此目录新建会话").on_click(
+					.child(Icon::new(icon).small().text_color(rgb(icon_color)))
+					.child(
+						div()
+							.flex_1()
+							.min_w_0()
+							.truncate()
+							.text_sm()
+							.font_weight(FontWeight::MEDIUM)
+							.text_color(rgb(p.foreground))
+							.child(folder_name(&cwd)),
+					)
+					.child(Button::new(("group-new", gi)).ghost().xsmall().label("+").tooltip(format!("在 {} 新建会话", display_path(&cwd))).on_click(
 						cx.listener(move |this, _, window, cx| {
 							cx.stop_propagation();
 							this.new_tab(new_cwd.clone(), window, cx);
 						}),
 					))
 					.on_click(cx.listener(move |this, _, _, cx| {
-						if !this.collapsed.remove(&toggle) {
-							this.collapsed.insert(toggle.clone());
+						if !this.unfolded.remove(&toggle) {
+							this.unfolded.insert(toggle.clone());
 						}
 						cx.notify();
 					}))
 					.test_support()
 					.into_any_element(),
 			);
+			// A folded group lists only its sessions with a run in progress
+			// (including one waiting on a dialog).
 			if folded {
+				for session in &group.sessions {
+					let status = open.get(session.path.as_path()).copied();
+					if matches!(status, Some(TabStatus::Running | TabStatus::Attention)) {
+						items.push(self.render_session(row, session, selected.as_deref(), status, now, p, cx));
+						row += 1;
+					}
+				}
 				continue;
 			}
-			for session in &group.sessions {
-				items.push(self.render_session(row, session, selected.as_deref(), &open, now, p, cx));
+			let expanded = searching || self.expanded_groups.contains(&cwd);
+			// Folded previews still list sessions open in a tab.
+			let mut hidden = 0usize;
+			for (i, session) in group.sessions.iter().enumerate() {
+				let status = open.get(session.path.as_path()).copied();
+				if !expanded && i >= GROUP_PREVIEW_SESSIONS && status.is_none() {
+					hidden += 1;
+					continue;
+				}
+				items.push(self.render_session(row, session, selected.as_deref(), status, now, p, cx));
 				row += 1;
+			}
+			if !searching && (hidden > 0 || (expanded && group.sessions.len() > GROUP_PREVIEW_SESSIONS)) {
+				let more_cwd = cwd.clone();
+				items.push(
+					div()
+						.id(("group-more", gi))
+						.flex()
+						.items_center()
+						.h(px(28.))
+						.pl_7()
+						.pr_3()
+						.my_0p5()
+						.rounded(px(8.))
+						.text_xs()
+						.text_color(rgb(p.muted_foreground))
+						.cursor_pointer()
+						.hover(|s| s.bg(rgb(p.muted)).text_color(rgb(p.foreground)))
+						.child(if expanded { "收起".to_owned() } else { format!("展开其余 {hidden} 个") })
+						.on_click(cx.listener(move |this, _, _, cx| {
+							if !this.expanded_groups.remove(&more_cwd) {
+								this.expanded_groups.insert(more_cwd.clone());
+							}
+							cx.notify();
+						}))
+						.test_support()
+						.into_any_element(),
+				);
 			}
 		}
 		let empty = items.is_empty();
 		div()
 			.id("sidebar")
-			.w(px(256.))
+			.w(px(304.))
 			.flex_none()
 			.h_full()
 			.flex()
@@ -557,17 +844,12 @@ impl Workspace {
 			.bg(rgb(p.panel))
 			.child(
 				div()
-					.p_2()
+					.p_2p5()
 					.flex()
 					.items_center()
-					.gap_1()
+					.gap_1p5()
 					.child(div().id("session-search").flex_1().child(Input::new(&self.search).small().cleanable(true)).test_support())
-					.child(Button::new("sidebar-new").ghost().small().label("+").tooltip("新建会话（⌘N）").on_click(cx.listener(
-						|this, _, window, cx| {
-							let cwd = this.tabs.get(this.active).map_or(this.default_cwd.clone(), |t| t.summary.cwd.clone());
-							this.new_tab(cwd, window, cx);
-						},
-					))),
+					.child(self.render_new_session_menu("sidebar-new", false, Anchor::TopRight, cx)),
 			)
 			.child(
 				div()
@@ -575,7 +857,7 @@ impl Workspace {
 					.flex_1()
 					.min_h_0()
 					.overflow_y_scroll()
-					.px_1()
+					.px_2()
 					.pb_2()
 					.children(items)
 					.when(empty, |list| {
@@ -598,78 +880,54 @@ impl Workspace {
 			})
 	}
 
-	#[allow(clippy::too_many_arguments)]
 	fn render_session(
 		&self,
 		row: usize,
 		session: &SessionInfo,
 		selected: Option<&Path>,
-		open: &HashSet<PathBuf>,
+		open: Option<TabStatus>,
 		now: SystemTime,
 		p: &theme::Palette,
 		cx: &mut Context<Self>,
 	) -> AnyElement {
 		let is_selected = selected == Some(session.path.as_path());
-		let is_open = open.contains(&session.path);
 		let (path, cwd) = (session.path.clone(), session.cwd.clone());
-		let (fork_path, fork_cwd, reveal) = (path.clone(), cwd.clone(), path.clone());
 		let title = session.title.clone().unwrap_or_else(|| "（未命名）".into());
+		let selected_bg = if cx.theme().is_dark() { p.muted } else { p.accent };
 		div()
 			.id(("session-row", row))
 			.flex()
-			.flex_col()
-			.gap_0p5()
-			.px_2()
-			.py_1p5()
-			.mt_0p5()
-			.rounded(px(6.))
+			.items_center()
+			.gap_2()
+			.h(px(34.))
+			.pl_2()
+			.pr_3()
+			.my_0p5()
+			.rounded(px(8.))
+			.text_sm()
 			.cursor_pointer()
-			.when(is_selected, |r| r.bg(rgb(p.accent)).border_1().border_color(rgb(p.primary)))
+			.when(is_selected, |r| {
+				r.bg(rgb(selected_bg))
+					.text_color(rgb(p.foreground))
+					.font_weight(FontWeight::MEDIUM)
+			})
 			.when(!is_selected, |r| r.hover(|s| s.bg(rgb(p.muted))))
+			// Same dot as the tab bar while the session is open in a tab.
 			.child(
-				div()
-					.flex()
-					.items_center()
-					.gap_2()
-					.text_sm()
-					.child(
-						div()
-							.flex_1()
-							.min_w_0()
-							.truncate()
-							.when(is_selected, |t| t.font_weight(FontWeight::SEMIBOLD))
-							.child(title),
-					)
-					.child(
-						div()
-							.flex_none()
-							.text_xs()
-							.text_color(rgb(p.muted_foreground))
-							.child(sessions::relative_age(session.modified, now)),
-					),
+				div().flex_none().w(px(12.)).flex().justify_center().when_some(open, |slot, status| {
+					slot.child(div().size(px(7.)).rounded_full().bg(rgb(status_style(status, p).0)))
+				}),
 			)
+			.child(div().flex_1().min_w_0().truncate().child(title))
+			.when_some(open.map(|status| status_style(status, p)), |row, (color, badge)| {
+				row.when_some(badge, |row, badge| row.child(div().flex_none().text_xs().text_color(rgb(color)).child(badge)))
+			})
 			.child(
 				div()
-					.flex()
-					.items_center()
-					.gap_1()
+					.flex_none()
 					.text_xs()
 					.text_color(rgb(p.muted_foreground))
-					.child(format!("#{}", session.short_id()))
-					.when(is_open, |r| r.child(div().text_color(rgb(p.accent_foreground)).child("已打开")))
-					.child(div().flex_1())
-					.child(Button::new(("session-fork", row)).ghost().xsmall().label("分支").tooltip("复制为新会话继续（fork），原会话不变").on_click(
-						cx.listener(move |this, _, window, cx| {
-							cx.stop_propagation();
-							this.open_session(&fork_path, &fork_cwd, true, window, cx);
-						}),
-					))
-					.child(Button::new(("session-reveal", row)).ghost().xsmall().label("定位").tooltip("在 Finder 中显示 JSONL").on_click(
-						cx.listener(move |_, _, _, cx| {
-							cx.stop_propagation();
-							cx.reveal_path(&reveal);
-						}),
-					)),
+					.child(sessions::relative_age(session.modified, now)),
 			)
 			.on_click(cx.listener(move |this, _, window, cx| this.open_session(&path, &cwd, false, window, cx)))
 			.test_support()
@@ -678,7 +936,7 @@ impl Workspace {
 }
 
 impl Render for Workspace {
-	fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+	fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
 		let p = theme::palette(cx);
 		let active = self.tabs.get(self.active).map(|tab| tab.view.clone());
 		div()
@@ -689,14 +947,40 @@ impl Render for Workspace {
 			.bg(rgb(p.background))
 			.text_color(cx.theme().foreground)
 			.capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| this.on_key(event, window, cx)))
-			.child(self.render_tab_bar(cx))
+			.on_action(cx.listener(|this, _: &NewTab, window, cx| this.run_command(Command::NewTab, window, cx)))
+			.on_action(cx.listener(|this, _: &NewTabInDir, window, cx| this.run_command(Command::NewTabInDir, window, cx)))
+			.on_action(cx.listener(|this, _: &CloseTab, window, cx| this.run_command(Command::CloseTab, window, cx)))
+			.on_action(cx.listener(|this, _: &SearchSessions, window, cx| this.run_command(Command::SearchSessions, window, cx)))
+			.on_action(cx.listener(|this, _: &ToggleSidebar, window, cx| this.run_command(Command::ToggleSidebar, window, cx)))
+			.on_action(cx.listener(|this, _: &TogglePanel, window, cx| this.run_command(Command::TogglePanel, window, cx)))
+			.on_action(cx.listener(|this, _: &CommandPalette, window, cx| this.open_palette(false, window, cx)))
+			.on_action(cx.listener(|this, _: &ModelPalette, window, cx| this.open_palette(true, window, cx)))
+			.on_action(cx.listener(|this, _: &CycleThinking, window, cx| this.run_command(Command::CycleThinking, window, cx)))
+			.on_action(cx.listener(|this, _: &OpenAccounts, window, cx| this.open_accounts(window, cx)))
+			.on_action(cx.listener(|_, _: &MinimizeWindow, window, _| window.minimize_window()))
+			.on_action(cx.listener(|_, _: &ZoomWindow, window, _| window.zoom_window()))
+			.on_action(cx.listener(|_, _: &ToggleFullScreen, window, _| window.toggle_fullscreen()))
+			.on_action(cx.listener(|this, _: &NextTab, window, cx| {
+				if !this.tabs.is_empty() {
+					this.activate((this.active + 1) % this.tabs.len(), window, cx);
+				}
+			}))
+			.on_action(cx.listener(|this, _: &PreviousTab, window, cx| {
+				if !this.tabs.is_empty() {
+					this.activate((this.active + this.tabs.len() - 1) % this.tabs.len(), window, cx);
+				}
+			}))
+			.child(self.render_tab_bar(window, cx))
 			.child(
 				div()
 					.flex_1()
 					.min_h_0()
 					.flex()
 					.when(self.sidebar, |row| row.child(self.render_sidebar(cx)))
-					.child(div().flex_1().min_w_0().h_full().relative().children(active)),
+					.child(match active {
+						Some(view) => div().flex_1().min_w_0().h_full().relative().child(view).into_any_element(),
+						None => self.render_empty(cx).into_any_element(),
+					}),
 			)
 			.when_some(self.palette.as_ref().map(|(view, _)| view.clone()), |root, view| {
 				root.child(
@@ -729,6 +1013,26 @@ impl Render for Workspace {
 	}
 }
 
+/// Dot color and optional badge for a tab's status, shared by the tab bar
+/// and the sidebar rows of open sessions.
+fn status_style(status: TabStatus, p: &theme::Palette) -> (u32, Option<&'static str>) {
+	match status {
+		TabStatus::Connecting => (p.warning, None),
+		TabStatus::Idle => (p.success, None),
+		TabStatus::Running => (p.primary, Some("•••")),
+		TabStatus::Attention => (p.warning, Some("待确认")),
+		TabStatus::Disconnected => (p.danger, Some("已断开")),
+	}
+}
+
+/// Directory basename for folder headers (falling back to `display_path`).
+fn folder_name(path: &Path) -> String {
+	path.file_name()
+		.and_then(|n| n.to_str())
+		.filter(|s| !s.is_empty())
+		.map_or_else(|| display_path(path), str::to_owned)
+}
+
 /// `~/…` for paths under the home directory.
 fn display_path(path: &Path) -> String {
 	if let Some(home) = std::env::var_os("HOME").map(PathBuf::from)
@@ -737,4 +1041,68 @@ fn display_path(path: &Path) -> String {
 		return if rest.as_os_str().is_empty() { "~".into() } else { format!("~/{}", rest.display()) };
 	}
 	path.display().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+	use ::core::prelude::v1::test;
+	use gpui_kit::test::TestWindowExt as _;
+
+	use super::*;
+
+	#[gpui_kit::test]
+	async fn sidebar_folder_clips_past_five_sessions_and_toggles(cx: &mut TestAppContext) {
+		cx.executor().allow_parking();
+		cx.update(gpui_kit::init);
+		cx.update(crate::theme::apply);
+		cx.update(init_menus);
+		let menus = cx.update(|cx| cx.get_menus().unwrap_or_default());
+		assert!(menus.iter().any(|m| m.name.as_ref() == "Window"), "Window menu registered for macOS window controls");
+
+		let dir = std::env::temp_dir().join(format!("omp-desktop-sidebar-test-{}", std::process::id()));
+		_ = std::fs::remove_dir_all(&dir);
+		std::fs::create_dir_all(&dir).unwrap();
+		let base = SessionOptions { omp: PathBuf::from("/nonexistent-omp"), session_dir: Some(dir.clone()), ..Default::default() };
+		let cwd_a = PathBuf::from("/tmp/proj-a");
+		let cwd_b = PathBuf::from("/tmp/proj-b");
+		let make_session = |id: usize, cwd: &Path| SessionInfo {
+			id:       format!("s{id}"),
+			path:     dir.join(format!("s{id}.jsonl")),
+			cwd:      cwd.to_owned(),
+			title:    Some(format!("会话 {id}")),
+			created:  None,
+			parent:   None,
+			modified: SystemTime::UNIX_EPOCH + Duration::from_secs(100 + id as u64),
+		};
+		let mut sessions: Vec<SessionInfo> = (1..=7).map(|i| make_session(i, &cwd_a)).collect();
+		sessions.extend((8..=10).map(|i| make_session(i, &cwd_b)));
+
+		let (handle, view) = cx.update(|cx| {
+			gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| cx.new(|cx| Workspace::new(base, cwd_a.clone(), window, cx))).unwrap()
+		});
+		view.update(cx, |this, cx| {
+			this.scan = Scan { sessions, skipped: 0 };
+			cx.notify();
+		});
+		cx.update_window(handle, |_, window, cx| {
+			window.render_frame(cx);
+			// Groups start folded, and no session is running, so no rows.
+			assert!(window.try_find(("session-row", 0usize)).is_none(), "folded groups hide idle sessions");
+			window.click(("group", 0usize), cx);
+			window.click(("group", 1usize), cx);
+			// Group 0 (proj-a, 7 sessions) shows 5 + toggle; group 1 (proj-b, 3 sessions) has no toggle.
+			assert!(window.try_find(("group-more", 0usize)).is_some(), "7 sessions should show toggle");
+			assert!(window.try_find(("group-more", 1usize)).is_none(), "3 sessions should not show toggle");
+			assert!(window.try_find(("session-row", 7usize)).is_some(), "5 + 3 = 8 rows (0..=7) visible initially");
+			assert!(window.try_find(("session-row", 8usize)).is_none(), "9th row hidden until expanded");
+
+			window.click(("group-more", 0usize), cx);
+			assert!(window.try_find(("session-row", 9usize)).is_some(), "all 10 rows (0..=9) visible once expanded");
+
+			window.click(("group-more", 0usize), cx);
+			assert!(window.try_find(("session-row", 8usize)).is_none(), "collapsed back to 5 sessions");
+		})
+		.unwrap();
+		_ = std::fs::remove_dir_all(&dir);
+	}
 }
