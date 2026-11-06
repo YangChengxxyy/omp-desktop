@@ -1,7 +1,7 @@
 //! One session tab: conversation stream, composer, status bar, and the
 //! dialog overlay for one omp process.
 
-use std::{path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{
@@ -27,6 +27,7 @@ use omp_store::display::{Block, Role, View};
 use crate::attachments;
 use crate::copy;
 use crate::dialog::{self, DialogEvent, DialogView};
+use crate::git;
 use crate::session::{Activity, Notice, PendingControl, SessionModel};
 use crate::slash;
 use crate::status;
@@ -96,6 +97,8 @@ pub struct ChatView {
 	/// the tab continues in a new file and the original stays untouched.
 	fork:         bool,
 	connection:   Connection,
+	/// Branch and working-tree state of `cwd`; `None` outside a repository.
+	git:          Option<git::GitStatus>,
 	/// From `get_state`. For a new session the file appears on disk only
 	/// after the first message.
 	session_file: Option<PathBuf>,
@@ -128,6 +131,8 @@ pub struct ChatView {
 	/// Abort requests sent, for tests that check one key press aborts once.
 	#[cfg(test)]
 	pub(crate) aborts: usize,
+	/// Polls `git status`; kept apart from `_tasks`, which reconnects clear.
+	_git_poll:    Option<Task<()>>,
 	_tasks:       Vec<Task<()>>,
 	_subs:        Vec<Subscription>,
 }
@@ -168,6 +173,7 @@ impl ChatView {
 			fork,
 			connection: Connection::Connecting,
 			model: SessionModel::default(),
+			git: None,
 			stats: None,
 			models: Vec::new(),
 			thinking_levels: Vec::new(),
@@ -184,11 +190,37 @@ impl ChatView {
 			expanded: Default::default(),
 			#[cfg(test)]
 			aborts: 0,
+			_git_poll: None,
 			_tasks: Vec::new(),
 			_subs: vec![sub],
 		};
 		view.connect(cx);
+		view.start_git_poll(cx);
 		view
+	}
+
+	/// Re-reads `git status` for `cwd` every few seconds, off the UI thread.
+	fn start_git_poll(&mut self, cx: &mut Context<Self>) {
+		const EVERY: Duration = Duration::from_secs(3);
+		let task = cx.spawn(async move |this, cx| {
+			loop {
+				let Ok(cwd) = this.update(cx, |this, _| this.cwd.clone()) else {
+					return;
+				};
+				let status = cx.background_spawn(crate::blocking::blocking(move || git::status(&cwd))).await;
+				let updated = this.update(cx, |this, cx| {
+					if this.git != status {
+						this.git = status;
+						cx.notify();
+					}
+				});
+				if updated.is_err() {
+					return;
+				}
+				cx.background_executor().timer(EVERY).await;
+			}
+		});
+		self._git_poll = Some(task);
 	}
 
 	fn connect(&mut self, cx: &mut Context<Self>) {
@@ -1493,6 +1525,34 @@ impl ChatView {
 			.text_color(rgb(p.muted_foreground))
 			.child(div().flex().items_center().gap_1().child(div().size(px(7.)).rounded_full().bg(rgb(dot))).child(label))
 			.child(div().min_w_0().truncate().child(self.cwd.display().to_string()))
+			.when_some(self.git.as_ref(), |row, git| {
+				let sync = git.sync_label();
+				let changes = git.changes_label();
+				let changes_color = if git.conflicted > 0 {
+					p.danger
+				} else if git.is_clean() {
+					p.success
+				} else {
+					p.warning
+				};
+				row.child(
+					div()
+						.id("status-git")
+						.flex_none()
+						.flex()
+						.items_center()
+						.gap_1p5()
+						.max_w(px(320.))
+						.child(div().min_w_0().truncate().child(format!("⎇ {}", git.head_label())))
+						.when(!sync.is_empty(), |d| d.child(div().flex_none().text_color(rgb(p.primary)).child(sync)))
+						.child(div().flex_none().text_color(rgb(changes_color)).child(changes))
+						.tooltip({
+							let text = git.tooltip();
+							move |window, cx| gpui_kit::component::tooltip::Tooltip::new(text.clone()).build(window, cx)
+						})
+						.test_support(),
+				)
+			})
 			.child(div().flex_1())
 			.when_some(self.model.status.clone(), |row, status| row.child(status))
 			.child(model_menu)

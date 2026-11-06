@@ -12,6 +12,7 @@ pub enum Command {
 	ToggleSidebar,
 	TogglePanel,
 	Accounts,
+	Settings,
 	Compact,
 	CycleThinking,
 	Theme(crate::theme::ThemeChoice),

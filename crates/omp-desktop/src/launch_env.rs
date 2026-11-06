@@ -52,13 +52,41 @@ pub fn default_cwd() -> PathBuf {
 }
 
 /// The saved launch directory (one path, `~/` allowed), when it is a directory.
-fn configured_cwd() -> Option<PathBuf> {
-	let file = home()?.join("Library/Application Support/omp-desktop/default-cwd");
+pub fn configured_cwd() -> Option<PathBuf> {
+	let file = default_cwd_file()?;
 	let text = std::fs::read_to_string(file).ok()?;
 	let dir = expand_home(text.trim());
 	(!text.trim().is_empty() && dir.is_dir()).then_some(dir)
 }
 
+fn default_cwd_file() -> Option<PathBuf> {
+	Some(home()?.join("Library/Application Support/omp-desktop/default-cwd"))
+}
+
+/// Saves the launch directory for GUI launches; `None` forgets it (home is
+/// used again).
+pub fn save_default_cwd(dir: Option<&Path>) -> std::io::Result<()> {
+	if cfg!(test) {
+		return Ok(());
+	}
+	let file = default_cwd_file().ok_or_else(|| std::io::Error::other("HOME 未设置"))?;
+	match dir {
+		Some(dir) => {
+			if let Some(parent) = file.parent() {
+				std::fs::create_dir_all(parent)?;
+			}
+			std::fs::write(&file, dir.to_string_lossy().as_bytes())
+		},
+		None => match std::fs::remove_file(&file) {
+			Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
+			_ => Ok(()),
+		},
+	}
+}
+
+pub fn home_dir() -> Option<PathBuf> {
+	home()
+}
 /// The omp binary: first match on PATH, then the usual install directories,
 /// else plain `omp` so the "not installed" screen names it.
 pub fn locate_omp() -> PathBuf {
